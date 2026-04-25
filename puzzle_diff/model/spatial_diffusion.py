@@ -701,24 +701,25 @@ class GNN_Diffusion(pl.LightningModule):
     def configure_optimizers(self):
         # optimizer = torch.optim.Adagrad(self.parameters(), lr=self.learning_rate)
         # optimizer = Adafactor(self.parameters())
-        optimizer = Adafactor(self.parameters())
+        # optimizer = Adafactor(self.parameters())
+        # return optimizer
+        optimizer = torch.optim.Adam(self.parameters(), lr=1e-4)
         return optimizer
 
     def training_step(self, batch, batch_idx):
-        # return super().training_step(*args, **kwargs)
-        batch_size = batch.batch.max().item() + 1
-        t = torch.randint(0, self.steps, (batch_size,), device=self.device).long()
+        with torch.enable_grad():
+            batch_size = batch.batch.max().item() + 1
+            t = torch.randint(0, self.steps, (batch_size,), device=self.device).long()
+            new_t = torch.gather(t, 0, batch.batch)
 
-        new_t = torch.gather(t, 0, batch.batch)
-
-        loss = self.p_losses(
-            batch.x,
-            new_t,
-            loss_type="huber",
-            cond=batch.patches,
-            edge_index=batch.edge_index,
-            batch=batch.batch,
-        )
+            loss = self.p_losses(
+                batch.x,
+                new_t,
+                loss_type="huber",
+                cond=batch.patches,
+                edge_index=batch.edge_index,
+                batch=batch.batch,
+            )
         if not self.all_equivariant:
             if batch_idx == 0 and self.local_rank == 0:
                 imgs, _ = self.p_sample_loop(
@@ -762,7 +763,6 @@ class GNN_Diffusion(pl.LightningModule):
                         )
 
         self.log("loss", loss)
-
         return loss
 
     @torch.no_grad()

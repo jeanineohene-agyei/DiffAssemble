@@ -12,7 +12,7 @@ class CelebA_HQ(Dataset):
     def __init__(self, train=True) -> None:
         super().__init__()
         all_images = set(
-            list(Path("datasets/CelebAMask-HQ/CelebA-HQ-img").glob("*.jpg"))
+            list(Path("/data/jeanine/CelebAMask-HQ/CelebA-HQ-img").glob("*.jpg"))
         )
         train_file = Path("datasets/data_splits/CelebA-HQ_train.txt")
         test_file = Path("datasets/data_splits/CelebA-HQ_test.txt")

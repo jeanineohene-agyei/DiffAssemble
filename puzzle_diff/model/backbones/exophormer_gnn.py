@@ -4,7 +4,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch_geometric.graphgym.register import register_layer
 from torch_geometric.nn.conv.transformer_conv import TransformerConv
-from torch_scatter import scatter
+# from torch_scatter import scatter
 
 def get_activation(activation):
     if activation == "relu":
