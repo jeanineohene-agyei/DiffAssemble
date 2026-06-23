@@ -1,0 +1,43 @@
+experiment_name: "oct_vis"
+
+batch_size: 16
+gpus: 1
+steps: 300
+num_workers: 8
+max_epochs: 1000
+
+dataset: oct
+oct_root: /data/jeanine/Diffassemble/
+target_num_slices: 97
+train_num_volumes: 10
+image_size: [224, 224]
+row_group_size: 2
+
+sampling: DDIM
+inference_ratio: 10
+
+offline: true
+wandb_id: null
+
+classifier_free_w: 0.2
+classifier_free_prob: 0.0
+data_augmentation: none
+checkpoint_path: ""
+noise_weight: 0.0
+
+predict_xstart: true  # predict xstart instead of noise, match paper "We train DiffAssemble to predict Xˆ0 instead of Xˆt−1"
+rotation: false
+only_rotation: false
+
+freeze_backbone: true
+visual_pretrained: true
+discrete: false
+backbone: efficientnet_b0
+architecture: transformer
+all_equivariant: false
+
+degree: -1
+virt_nodes: 4
+inf_fully: false
+acc_grad: 0
+save_eval_images: false

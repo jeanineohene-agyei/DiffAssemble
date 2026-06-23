@@ -343,9 +343,7 @@ class Puzzle_Dataset_Pad(Puzzle_Dataset):
 
         img = img.resize((width, height))#, resample=Resampling.BICUBIC)
 
-        img = self.trans
-
-        forms(img)
+        img = self.transforms(img)
         xy, patches = divide_images_into_patches(img, patch_per_dim, self.patch_size)
 
         xy = einops.rearrange(xy, "x y c -> (x y) c")

@@ -7,6 +7,8 @@ Puzzle-Diff/
 dataset_old_delete/
 .vscode/
 wandb/
+rl_whole_eye_oct/
+rl_whole_eye_oct/*
 
 singularity/*.o*
 .ipynb_checkpoints
@@ -29,6 +31,7 @@ singularity/*.o*
 *.ckpt
 *.sif
 *.pyc
+*.gif
 
 *.ipynb
 
