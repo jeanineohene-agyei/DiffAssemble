@@ -9,9 +9,14 @@ SEG_PATH = Path("datasets/rl-whole-eye/processed_data/batch_000/881ca00e6c71/881
 SEED = 0
 
 DENSE_SIZE = 30
-NUM_BATCHES = 4
+
+MIN_NUM_BATCHES = 2
+MAX_NUM_BATCHES = 8
+
 MIN_BATCH_SIZE = 2
 MAX_BATCH_SIZE = 10
+
+SCAN_SPACING = 0.08
 
 CROP_L = 220
 
@@ -83,7 +88,14 @@ def sample_one_batch(rng, dense_indices):
 
 
 def sample_batches(rng, dense_indices):
-    return [sample_one_batch(rng, dense_indices) for _ in range(NUM_BATCHES)]
+    num_batches = rng.integers(MIN_NUM_BATCHES, MAX_NUM_BATCHES + 1)
+
+    batches = [
+        sample_one_batch(rng, dense_indices)
+        for _ in range(num_batches)
+    ]
+
+    return batches
 
 
 def sample_crop_rows(rng, H):
@@ -130,7 +142,8 @@ def crop_xy_to_grid(x_scan, crop_x_norm, crop_y_norm, displayed_height, crop_sha
 
 
 def make_debug_plot(stack_vis, seg_vis, dense_indices, batches, crop_rows, out_path):
-    xs = np.linspace(-1.0, 1.0, len(dense_indices))
+    center = (len(dense_indices) - 1) / 2
+    xs = (np.arange(len(dense_indices)) - center) * SCAN_SPACING
     idx_to_x = dict(zip(dense_indices, xs))
 
     cr0, cr1 = crop_rows
@@ -144,7 +157,9 @@ def make_debug_plot(stack_vis, seg_vis, dense_indices, batches, crop_rows, out_p
         ax.text(x, -0.72, str(idx), ha="center", fontsize=8)
 
     ax.scatter(xs, np.zeros(len(xs)), s=20)
-    ax.set_xlim(-1.15, 1.15)
+    x_pad = SCAN_SPACING * 2
+    xlim = (xs.min() - x_pad, xs.max() + x_pad)
+    ax.set_xlim(xlim)
     ax.set_ylim(-0.75, 0.75)
     ax.set_title("Full dense volume locked on grid")
     ax.set_xlabel("X")
@@ -156,8 +171,8 @@ def make_debug_plot(stack_vis, seg_vis, dense_indices, batches, crop_rows, out_p
     crop_targets = []
 
     for b, batch_indices in enumerate(batches):
-        y_offset = 0.18 * (b - (len(batches) - 1) / 2)
-        # y_offset = 0
+        # y_offset = 0.18 * (b - (len(batches) - 1) / 2)
+        y_offset = 0
 
         for idx in batch_indices:
             x_scan = idx_to_x[idx]
@@ -191,12 +206,12 @@ def make_debug_plot(stack_vis, seg_vis, dense_indices, batches, crop_rows, out_p
             ax.text(gx, gy + 0.04, f"b{b}", ha="center", fontsize=7)
 
     for b, batch_indices in enumerate(batches):
-        y_offset = 0.18 * (b - (len(batches) - 1) / 2)
-        # y_offset = 0
         batch_xs = [idx_to_x[i] for i in batch_indices]
         ax.scatter(batch_xs, [y_offset] * len(batch_xs), s=20)
 
-    ax.set_xlim(-1.15, 1.15)
+    x_pad = SCAN_SPACING * 2
+    xlim = (xs.min() - x_pad, xs.max() + x_pad)
+    ax.set_xlim(xlim)
     ax.set_ylim(-0.9, 0.9)
     ax.set_title("Random batches with same crop row window")
     ax.set_xlabel("X")
