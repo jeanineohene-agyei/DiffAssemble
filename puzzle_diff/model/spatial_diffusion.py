@@ -1,9 +1,6 @@
-import colorsys
 import enum
 
 import logging
-
-import math
 
 # from .backbones.Transformer_GNN import Transformer_GNN
 from collections import defaultdict
@@ -17,41 +14,18 @@ import matplotlib.pyplot as plt
 import numpy as np
 import PIL
 import pytorch_lightning as pl
-import scipy
-import timm
-from PIL import ImageOps
 
-# from .network_modules import (
-#     default,
-#     partial,
-#     SinusoidalPositionEmbeddings,
-#     PreNorm,
-#     Downsample,
-#     Upsample,
-#     Residual,
-#     LinearAttention,
-#     ConvNextBlock,
-#     ResnetBlock,
-#     Attention,
-#     exists,
-# )
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import torch_geometric.nn.models
 import torchmetrics
-import torchvision
-import torchvision.transforms.functional as trF
 from kornia.geometry.transform import Rotate as krot
-from PIL import Image
 from torch import Tensor
-from torch.optim import Adam
 from tqdm import tqdm
-from transformers.optimization import Adafactor
 
 import wandb
 
-from .backbones import Dark_TFConv, Eff_GAT
+from .backbones import Eff_GAT
 
 
 matplotlib.use("agg")
@@ -75,56 +49,6 @@ class ModelScheduler(enum.Enum):
     LINEAR = enum.auto()  # the model predicts x_{t-1}
     COSINE = enum.auto()  # the model predicts x_0
     COSINE_DISCRETE = enum.auto()  # the model predicts epsilon
-
-
-def interpolate_color1d(color1, color2, fraction):
-    # color1 = [float(x) / 255 for x in color1]
-    # color2 = [float(x) / 255 for x in color2]
-    hsv1 = color1  #  colorsys.rgb_to_hsv(*color1)
-    hsv2 = color2  #  colorsys.rgb_to_hsv(*color2)
-    h = hsv1[0] + (hsv2[0] - hsv1[0]) * fraction
-    s = hsv1[1] + (hsv2[1] - hsv1[1]) * fraction
-    v = hsv1[2] + (hsv2[2] - hsv1[2]) * fraction
-    return tuple(x for x in (h, s, v))
-
-
-def interpolate_color(
-    pos, col_1=(1, 0, 0), col_2=(1, 1, 0), col_3=(0, 0, 1), col_4=(0, 1, 0)
-):
-    f1 = float((pos[0] + 1) / 2)
-    f2 = float((pos[1] + 1) / 2)
-    c1 = interpolate_color1d(col_1, col_2, f1)
-    c2 = interpolate_color1d(col_3, col_4, f1)
-    return interpolate_color1d(c1, c2, f2)
-
-
-def num_to_groups(num, divisor):
-    groups = num // divisor
-    remainder = num % divisor
-    arr = [divisor] * groups
-    if remainder > 0:
-        arr.append(remainder)
-    return arr
-
-
-def rotate_images(patches, rot_vector):
-    angle_vec = rot_vector  # x_noisy[:, -2:]
-    angles = -torch.atan2(angle_vec[:, 1], angle_vec[:, 0]) / torch.pi * 180
-
-    # angles = torch.round(angles/90) * 90
-    # angles[angles < 0] = 360 + angles[angles < 0]
-    # angles[angles == -0] = 0
-    # rotated_patches = torch.stack(
-    #     [trF.rotate(cond_img, rot.item()) for cond_img, rot in zip(patches, angles)]
-    # )
-
-    r = krot(angles, mode="nearest")
-
-    # rot2 = r(patches)
-    rot2 = torch.stack([r(patches[:, i, :, :, :]) for i in range(4)]).permute(
-        1, 0, 2, 3, 4
-    )
-    return rot2
 
 
 def cosine_discrete_beta_schedule(timesteps, s=0.08):
@@ -155,19 +79,6 @@ def linear_beta_schedule(timesteps):
     beta_start = 0.0001
     beta_end = 0.02
     return torch.linspace(beta_start, beta_end, timesteps)
-
-
-def quadratic_beta_schedule(timesteps):
-    beta_start = 0.0001
-    beta_end = 0.02
-    return torch.linspace(beta_start**0.5, beta_end**0.5, timesteps) ** 2
-
-
-def sigmoid_beta_schedule(timesteps):
-    beta_start = 0.0001
-    beta_end = 0.02
-    betas = torch.linspace(-6, 6, timesteps)
-    return torch.sigmoid(betas) * (beta_end - beta_start) + beta_start
 
 
 def extract(a, t, x_shape=None):
@@ -356,20 +267,29 @@ class GNN_Diffusion(pl.LightningModule):
                 virt_nodes=self.virt_nodes,
             )
 
+    # def initialize_torchmetrics(self, n_patches):
+    #     metrics = {}
+
+    #     for i in n_patches:
+    #         metrics[f"{i}_acc"] = torchmetrics.MeanMetric()
+    #         metrics[f"{i}__piece_acc"] = torchmetrics.MeanMetric()
+    #         metrics[f"{i}_nImages"] = torchmetrics.SumMetric()
+    #     metrics["overall_acc"] = torchmetrics.MeanMetric()
+    #     metrics["overall__piece_acc"] = torchmetrics.MeanMetric()
+    #     metrics["overall_nImages"] = torchmetrics.SumMetric()
+    #     self.metrics = nn.ModuleDict(metrics)
+    
     def initialize_torchmetrics(self, n_patches):
-        metrics = {}
+        self.metrics = nn.ModuleDict({
+            "val_mse": torchmetrics.MeanMetric(),
+            "val_rmse": torchmetrics.MeanMetric(),
+            "val_mae": torchmetrics.MeanMetric(),
+            "val_mean_dist": torchmetrics.MeanMetric(),
+            "overall_acc": torchmetrics.MeanMetric(),  # keep only because checkpoint monitors this
+        })
 
-        for i in n_patches:
-            metrics[f"{i}_acc"] = torchmetrics.MeanMetric()
-            metrics[f"{i}__piece_acc"] = torchmetrics.MeanMetric()
-            metrics[f"{i}_nImages"] = torchmetrics.SumMetric()
-        metrics["overall_acc"] = torchmetrics.MeanMetric()
-        metrics["overall__piece_acc"] = torchmetrics.MeanMetric()
-        metrics["overall_nImages"] = torchmetrics.SumMetric()
-        self.metrics = nn.ModuleDict(metrics)
-
-    def forward(self, xy_pos, time, patch_rgb, edge_index, batch) -> Any:
-        return self.model(xy_pos, time, patch_rgb, edge_index, batch)
+    def forward(self, xy_pos, time, patch_rgb, edge_index, batch, is_anchor=None) -> Any:
+        return self.model(xy_pos, time, patch_rgb, edge_index, batch, is_anchor=is_anchor)
         # # mean = patch_rgb.new_tensor([0.4850, 0.4560, 0.4060])[None, :, None, None]
         # # std = patch_rgb.new_tensor([0.2290, 0.2240, 0.2250])[None, :, None, None]
         # # if patch_feats == None:
@@ -394,14 +314,14 @@ class GNN_Diffusion(pl.LightningModule):
         self,
         xy_pos: Tensor,
         time: Tensor,
-        patch_rgb: Tensor,
         edge_index: Tensor,
         patch_feats: Tensor,
         batch,
+        is_anchor=None,
         return_attentions=False,
     ) -> Any:
         out, attentions = self.model.forward_with_feats(
-            xy_pos, time, patch_rgb, edge_index, patch_feats, batch
+            xy_pos, time, edge_index, patch_feats, batch, is_anchor=is_anchor
         )
         if return_attentions:
             return out, attentions
@@ -416,11 +336,15 @@ class GNN_Diffusion(pl.LightningModule):
         # )
         # return patch_feats
         return self.model.visual_features(patch_rgb)
-
     # forward diffusion
-    def q_sample(self, x_start, t, noise=None):
+    def q_sample(self, x_start, t, noise=None, is_anchor=None):
         if noise is None:
             noise = torch.randn_like(x_start)
+            
+        if is_anchor is not None:
+            anchor_mask = is_anchor.bool().view(-1, 1)
+            noise = noise.clone()
+            noise[anchor_mask.expand_as(noise)] = 0.0
 
         sqrt_alphas_cumprod_t = extract(self.sqrt_alphas_cumprod, t, x_start.shape)
         sqrt_one_minus_alphas_cumprod_t = extract(
@@ -438,11 +362,12 @@ class GNN_Diffusion(pl.LightningModule):
         cond=None,
         edge_index=None,
         batch=None,
+        is_anchor=None,
     ):
         if noise is None:
             noise = torch.randn_like(x_start)
 
-        x_noisy = self.q_sample(x_start=x_start, t=t, noise=noise)
+        x_noisy = self.q_sample(x_start=x_start, t=t, noise=noise, is_anchor=is_anchor)
         if self.steps == 1:  # Transformer case
             x_noisy = torch.zeros_like(x_noisy)
         # if self.rotation:
@@ -459,17 +384,21 @@ class GNN_Diffusion(pl.LightningModule):
         prediction = self.forward_with_feats(
             x_noisy,
             t,
-            cond,
             edge_index,
             patch_feats=patch_feats,  # classifier_free_patch_feats,
             batch=batch,
             return_attentions=False,
+            is_anchor=is_anchor,
         )
 
         target = {
             ModelMeanType.START_X: x_start,
             ModelMeanType.EPSILON: noise,
         }[self.model_mean_type]
+        if is_anchor is not None:
+            keep = ~is_anchor.bool().view(-1)
+            target = target[keep]
+            prediction = prediction[keep]
 
         if loss_type == "l1":
             loss = F.l1_loss(target, prediction)
@@ -483,7 +412,7 @@ class GNN_Diffusion(pl.LightningModule):
         return loss
 
     @torch.no_grad()
-    def p_sample_ddpm(self, x, t, t_index, cond, edge_index, patch_feats, batch):
+    def p_sample_ddpm(self, x, t, t_index, cond, edge_index, patch_feats, batch, is_anchor=None):
         betas_t = extract(self.betas, t, x.shape)
         sqrt_one_minus_alphas_cumprod_t = extract(
             self.sqrt_one_minus_alphas_cumprod, t, x.shape
@@ -496,19 +425,31 @@ class GNN_Diffusion(pl.LightningModule):
             x
             - betas_t
             * self.forward_with_feats(
-                x, t, cond, edge_index, patch_feats=patch_feats, batch=batch
+                x, t, edge_index, patch_feats=patch_feats, batch=batch, is_anchor=is_anchor
             )
             / sqrt_one_minus_alphas_cumprod_t
         )
+        
+        if is_anchor is not None:
+            anchor_mask = is_anchor.bool().view(-1, 1)
+            model_mean = model_mean.clone()
+            model_mean[anchor_mask.expand_as(model_mean)] = 0.0
 
         if t_index == 0:
             return model_mean
         else:
             posterior_variance_t = extract(self.posterior_variance, t, x.shape)
             noise = torch.randn_like(x)
-            # Algorithm 2 line 4:
-            return model_mean + torch.sqrt(posterior_variance_t) * noise
 
+            out = model_mean + torch.sqrt(posterior_variance_t) * noise
+
+            # also keep anchor fixed after adding DDPM noise
+            if is_anchor is not None:
+                out = out.clone()
+                out[anchor_mask.expand_as(out)] = 0.0
+
+            return out
+        
     def _get_variance_old(self, timestep, prev_timestep):
         alpha_prod_t = self.alphas_cumprod[timestep]
         alpha_prod_t_prev = (
@@ -547,10 +488,14 @@ class GNN_Diffusion(pl.LightningModule):
 
     @torch.no_grad()
     def p_sample_ddim(
-        self, x, t, t_index, cond, edge_index, patch_feats, batch
+        self, x, t, t_index, cond, edge_index, patch_feats, batch, is_anchor=None
     ):  # (self, x, t, t_index, cond):
-        # if t[0] == 0:
-        #     return x
+        if is_anchor is not None:
+            anchor_mask = is_anchor.bool().view(-1, 1)
+            x = x.clone()
+            x[anchor_mask.expand_as(x)] = 0.0
+        else:
+            anchor_mask = None
 
         prev_timestep = t - self.inference_ratio
 
@@ -560,70 +505,78 @@ class GNN_Diffusion(pl.LightningModule):
         if (prev_timestep >= 0).all():
             alpha_prod_prev = extract(self.alphas_cumprod, prev_timestep, x.shape)
         else:
-            alpha_prod_prev = alpha_prod * 0 + 1
+            alpha_prod_prev = torch.ones_like(alpha_prod)
 
         beta = 1 - alpha_prod
-        beta_prev = 1 - alpha_prod_prev
 
         if self.classifier_free_prob > 0.0:
             model_output_cond, attentions = self.forward_with_feats(
                 x,
                 t,
-                cond,
                 edge_index,
                 patch_feats=patch_feats,
                 batch=batch,
                 return_attentions=True,
+                is_anchor=is_anchor,
             )
 
             model_output_uncond = self.forward_with_feats(
                 x,
                 t,
-                cond,
                 edge_index,
                 patch_feats=torch.zeros_like(patch_feats),
                 batch=batch,
+                is_anchor=is_anchor,
             )
+
             model_output = (
-                1 + self.classifier_free_w
-            ) * model_output_cond - self.classifier_free_w * model_output_uncond
+                (1 + self.classifier_free_w) * model_output_cond
+                - self.classifier_free_w * model_output_uncond
+            )
         else:
             model_output, attentions = self.forward_with_feats(
                 x,
                 t,
-                cond,
                 edge_index,
                 patch_feats=patch_feats,
                 batch=batch,
                 return_attentions=True,
+                is_anchor=is_anchor,
             )
-
-        # estimate x_0
 
         x_0 = {
-            ModelMeanType.EPSILON: (x - beta**0.5 * model_output) / alpha_prod**0.5,
+            ModelMeanType.EPSILON: (
+                x - torch.sqrt(beta) * model_output
+            ) / torch.sqrt(alpha_prod),
             ModelMeanType.START_X: model_output,
         }[self.model_mean_type]
+
+        if anchor_mask is not None:
+            x_0 = x_0.clone()
+            x_0[anchor_mask.expand_as(x_0)] = 0.0
+
         eps = self._predict_eps_from_xstart(x, t, x_0)
 
-        variance = self._get_variance(
-            t, prev_timestep
-        )  # (beta_prev / beta) * (1 - alpha_prod / alpha_prod_prev)
+        variance = self._get_variance(t, prev_timestep)
+        std_eta = eta * torch.sqrt(variance)
 
-        std_eta = eta * variance**0.5
+        pred_sample_direction = (
+            torch.sqrt(1 - alpha_prod_prev - std_eta ** 2) * eps
+        )
 
-        # estimate "direction to x_t"
-
-        pred_sample_direction = (1 - alpha_prod_prev - std_eta**2) ** (0.5) * eps
-
-        # x_t-1 = a * x_0 + b * eps
-        prev_sample = alpha_prod_prev ** (0.5) * x_0 + pred_sample_direction
+        prev_sample = (
+            torch.sqrt(alpha_prod_prev) * x_0
+            + pred_sample_direction
+        )
 
         if eta > 0:
-            noise = torch.randn(model_output.shape, dtype=model_output.dtype).to(
-                self.device
-            )
+            noise = torch.randn_like(model_output)
             prev_sample = prev_sample + std_eta * noise
+
+        if anchor_mask is not None:
+            prev_sample = prev_sample.clone()
+            prev_sample[anchor_mask.expand_as(prev_sample)] = 0.0
+
         return prev_sample, attentions
 
     def _predict_eps_from_xstart(self, x_t, t, pred_xstart):
@@ -633,13 +586,14 @@ class GNN_Diffusion(pl.LightningModule):
 
     # Algorithm 2 but save all images:
     @torch.no_grad()
-    def p_sample_loop(self, shape, cond, edge_index, batch):
+    def p_sample_loop(self, shape, cond, edge_index, batch, is_anchor=None,):
         # device = next(model.parameters()).device
         device = self.device
 
         b = shape[0]
         # start from pure noise (for each example in the batch)
         img = torch.randn(shape, device=device) * self.noise_weight
+        print("initial img std:", img.std().item(), "min:", img.min().item(), "max:", img.max().item())
         # img = einops.rearrange(
         #     img,
         #     "b c (w1 w) (h1 h) -> b (w1 h1) c w h",
@@ -669,7 +623,12 @@ class GNN_Diffusion(pl.LightningModule):
                 edge_index=edge_index,
                 patch_feats=patch_feats,
                 batch=batch,
+                is_anchor=is_anchor,
             )
+            
+            if is_anchor is not None:
+                anchor_mask = is_anchor.bool().view(-1, 1)
+                img[anchor_mask.expand_as(img)] = 0.0
 
             attentions.append(atts)
             imgs.append(img)
@@ -677,9 +636,9 @@ class GNN_Diffusion(pl.LightningModule):
 
     @torch.no_grad()
     def p_sample(
-        self, x, t, t_index, cond, edge_index, sampling_func, patch_feats, batch
+        self, x, t, t_index, cond, edge_index, sampling_func, patch_feats, batch, is_anchor=None
     ):
-        return sampling_func(x, t, t_index, cond, edge_index, patch_feats, batch)
+        return sampling_func(x, t, t_index, cond, edge_index, patch_feats, batch, is_anchor=is_anchor)
 
     @torch.no_grad()
     def sample(
@@ -696,6 +655,7 @@ class GNN_Diffusion(pl.LightningModule):
             cond=cond,
             edge_index=edge_index,
             batch=batch,
+            is_anchor=batch.is_anchor,
         )
 
     def configure_optimizers(self):
@@ -703,7 +663,7 @@ class GNN_Diffusion(pl.LightningModule):
         # optimizer = Adafactor(self.parameters())
         # optimizer = Adafactor(self.parameters())
         # return optimizer
-        optimizer = torch.optim.Adam(self.parameters(), lr=1e-4)
+        optimizer = torch.optim.Adam(self.parameters(), lr=self.learning_rate)
         return optimizer
 
     def training_step(self, batch, batch_idx):
@@ -719,48 +679,47 @@ class GNN_Diffusion(pl.LightningModule):
                 cond=batch.patches,
                 edge_index=batch.edge_index,
                 batch=batch.batch,
+                is_anchor=batch.is_anchor,
             )
+
         if not self.all_equivariant:
             if batch_idx == 0 and self.local_rank == 0:
                 imgs, _ = self.p_sample_loop(
-                    batch.x.shape, batch.patches, batch.edge_index, batch=batch.batch
+                    batch.x.shape,
+                    batch.patches,
+                    batch.edge_index,
+                    batch=batch.batch,
+                    is_anchor=batch.is_anchor,
                 )
-                img = imgs[-1]
 
+                img = imgs[-1]
                 save_path = Path(f"results/{self.logger.experiment.name}/train")
-                for i in range(
-                    min(batch.batch.max().item(), 4)
-                ):  # save max 4 images during training loop
+
+                for i in range(min(batch.batch.max().item() + 1, 4)):
                     idx = torch.where(batch.batch == i)[0]
-                    patches_rgb = batch.patches[idx]
-                    gt_pos = batch.x[idx]
-                    pos = img[idx]
-                    n_patches = batch.patches_dim[i]
-                    i_name = batch.ind_name[i]
-                    if self.rotation:
-                        gt_pos = batch.x[idx, :2]
-                        pos = img[idx, :2]
-                        pred_rot = img[idx, 2:]
-                        gt_rot = batch.x[idx, 2:]
-                        self.save_image_rotated(
-                            patches_rgb=patches_rgb,
-                            pos=pos,
-                            gt_pos=gt_pos,
-                            patches_dim=n_patches,
-                            ind_name=i_name,
-                            file_name=save_path,
-                            gt_rotations=gt_rot,
-                            pred_rotations=pred_rot,
-                        )
-                    else:
-                        self.save_image(
-                            patches_rgb=patches_rgb,
-                            pos=pos,
-                            gt_pos=gt_pos,
-                            patches_dim=n_patches,
-                            ind_name=i_name,
-                            file_name=save_path,
-                        )
+
+                    self.save_oct_image(
+                        patches_rgb=batch.patches[idx],
+                        pos=img[idx],
+                        gt_pos=batch.x[idx],
+                        raw_pos=batch.raw_xy[idx],
+                        scan_indices=batch.scan_indices[idx],
+                        batch_ids=batch.batch_ids[idx],
+                        is_anchor=batch.is_anchor[idx],
+                        ind_name=batch.ind_name[i],
+                        file_name=save_path,
+                        dense_imgs=batch.dense_imgs[i],
+                        dense_scan_indices=batch.dense_scan_indices[i],
+                        dense_y=batch.dense_y[i],
+                        # xlim=batch.xlim[i],
+                        # ylim=batch.ylim[i],
+                        xlim=batch.xlim.view(-1, 2)[i],
+    ylim=batch.ylim.view(-1, 2)[i],
+                        full_width=batch.full_width[i],
+                        crop_display_width=batch.crop_display_width[i],
+                        display_height=batch.display_height[i],
+                        title_prefix="train",
+                    )
 
         self.log("loss", loss)
         return loss
@@ -768,140 +727,210 @@ class GNN_Diffusion(pl.LightningModule):
     @torch.no_grad()
     def prediction_step(self, batch, batch_idx):
         indexes = self.p_sample_loop(
-            batch.x.shape, batch.patches, batch.edge_index, batch=batch.batch
+            batch.x.shape, batch.patches, batch.edge_index, batch=batch.batch, is_anchor=batch.is_anchor
         )
         return indexes
 
+    # def validation_step(self, batch, batch_idx):
+    #     with torch.no_grad():
+    #         imgs, attentions = self.p_sample_loop(
+    #             batch.x.shape, batch.patches, batch.edge_index, batch=batch.batch
+    #         )
+
+    #         img = imgs[-1]
+
+    #         for i in range(batch.batch.max() + 1):
+    #             idx = torch.where(batch.batch == i)[0]
+    #             patches_rgb = batch.patches[idx]
+    #             gt_pos = batch.x[idx, :2]
+    #             pos = img[idx, :2]
+    #             n_patches = batch.patches_dim[i].tolist()
+    #             i_name = batch.ind_name[i]
+
+    #             y = torch.linspace(-1, 1, n_patches[0], device=self.device)
+    #             x = torch.linspace(-1, 1, n_patches[1], device=self.device)
+    #             xy = torch.stack(torch.meshgrid(x, y, indexing="xy"), -1)
+    #             real_grid = einops.rearrange(xy, "x y c-> (x y) c")
+
+    #             gt_ass = greedy_cost_assignment(gt_pos, real_grid)
+    #             sort_idx = torch.sort(gt_ass[:, 0])[1]
+    #             gt_ass = gt_ass[sort_idx]
+
+    #             pred_ass = greedy_cost_assignment(pos, real_grid)
+    #             sort_idx = torch.sort(pred_ass[:, 0])[1]
+
+    #             if False:
+    #                 pred1 = pred_ass[sort_idx][:, 1]
+
+    #                 pred2 = torch.rot90(
+    #                     pred_ass[:, 1].view(n_patches[0], n_patches[1])
+    #                 ).flatten()
+    #                 pred3 = torch.rot90(
+    #                     pred2.view(n_patches[0], n_patches[1])
+    #                 ).flatten()
+    #                 pred4 = torch.rot90(
+    #                     pred3.view(n_patches[0], n_patches[1])
+    #                 ).flatten()
+
+    #                 preds = [pred1, pred2, pred3, pred4]
+    #                 correct = np.max(
+    #                     [
+    #                         (gt_ass[:, 1] == pred1).all(),
+    #                         (gt_ass[:, 1] == pred2).all(),
+    #                         (gt_ass[:, 1] == pred3).all(),
+    #                         (gt_ass[:, 1] == pred4).all(),
+    #                     ]
+    #                 )
+
+    #                 accuracy_rots = [
+    #                     torch.tensor(gt_ass[:, 1] == pred1),
+    #                     (gt_ass[:, 1] == pred2),
+    #                     (gt_ass[:, 1] == pred3),
+    #                     (gt_ass[:, 1] == pred4),
+    #                 ]
+    #                 piece_accuracy = accuracy_rots[
+    #                     np.argmax(
+    #                         [
+    #                             accuracy_rots[0].sum(),
+    #                             accuracy_rots[1].sum(),
+    #                             accuracy_rots[2].sum(),
+    #                             accuracy_rots[3].sum(),
+    #                         ]
+    #                     )
+    #                 ].to(self.device)
+    #             else:
+    #                 pred = pred_ass[sort_idx][:, 1]
+
+    #                 correct = (gt_ass[:, 1] == pred).all()
+    #                 piece_accuracy = torch.tensor(gt_ass[:, 1] == pred).to(self.device)
+
+    #             if self.rotation:
+    #                 pred_rot = img[idx, 2:]
+    #                 gt_rot = batch.x[idx, 2:]
+
+    #                 rot_correct = torch.cosine_similarity(pred_rot, gt_rot) > math.cos(
+    #                     math.pi / 4
+    #                 )
+    #                 correct = correct and rot_correct.all()
+    #                 piece_accuracy = rot_correct * piece_accuracy
+
+    #             # self.num_images += 1
+    #             if not self.all_equivariant:
+    #                 if (
+    #                     self.local_rank == 0
+    #                     and batch_idx < 10
+    #                     and i < min(batch.batch.max().item(), 4)
+    #                 ):
+    #                     save_path = Path(f"results/{self.logger.experiment.name}/val")
+
+    #                     if self.rotation:
+    #                         self.save_image_rotated(
+    #                             patches_rgb=patches_rgb,
+    #                             pos=pos,
+    #                             gt_pos=gt_pos,
+    #                             patches_dim=n_patches,
+    #                             ind_name=i_name,
+    #                             file_name=save_path,
+    #                             correct=correct,
+    #                             gt_rotations=gt_rot,
+    #                             pred_rotations=pred_rot,
+    #                         )
+    #                     else:
+    #                         self.save_image(
+    #                             patches_rgb=patches_rgb,
+    #                             pos=pos,
+    #                             gt_pos=gt_pos,
+    #                             patches_dim=n_patches,
+    #                             ind_name=i_name,
+    #                             file_name=save_path,
+    #                             correct=correct,
+    #                         )
+
+    #             self.metrics[f"{tuple(n_patches)}_nImages"].update(1)
+    #             self.metrics["overall_nImages"].update(1)
+    #             self.metrics[f"{tuple(n_patches)}__piece_acc"].update(piece_accuracy)
+    #             if correct:
+    #                 # if (assignement[:, 0] == assignement[:, 1]).all():
+    #                 self.metrics[f"{tuple(n_patches)}_acc"].update(1)
+    #                 self.metrics["overall_acc"].update(1)
+    #                 # accuracy_dict[tuple(n_patches)].append(1)
+    #             else:
+    #                 self.metrics[f"{tuple(n_patches)}_acc"].update(0)
+    #                 self.metrics["overall_acc"].update(0)
+    #                 # accuracy_dict[tuple(n_patches)].append(0)
+
+    #         self.log_dict(self.metrics)
+    #     # return accuracy_dict
+    
     def validation_step(self, batch, batch_idx):
         with torch.no_grad():
-            imgs, attentions = self.p_sample_loop(
-                batch.x.shape, batch.patches, batch.edge_index, batch=batch.batch
+            imgs, _ = self.p_sample_loop(
+                batch.x.shape,
+                batch.patches,
+                batch.edge_index,
+                batch=batch.batch,
+                is_anchor=batch.is_anchor,
             )
 
             img = imgs[-1]
 
-            for i in range(batch.batch.max() + 1):
+            for i in range(batch.batch.max().item() + 1):
                 idx = torch.where(batch.batch == i)[0]
+
                 patches_rgb = batch.patches[idx]
                 gt_pos = batch.x[idx, :2]
+                raw_pos = batch.raw_xy[idx, :2]
                 pos = img[idx, :2]
-                n_patches = batch.patches_dim[i].tolist()
                 i_name = batch.ind_name[i]
 
-                y = torch.linspace(-1, 1, n_patches[0], device=self.device)
-                x = torch.linspace(-1, 1, n_patches[1], device=self.device)
-                xy = torch.stack(torch.meshgrid(x, y, indexing="xy"), -1)
-                real_grid = einops.rearrange(xy, "x y c-> (x y) c")
+                non_anchor = ~batch.is_anchor[idx].bool().view(-1)
 
-                gt_ass = greedy_cost_assignment(gt_pos, real_grid)
-                sort_idx = torch.sort(gt_ass[:, 0])[1]
-                gt_ass = gt_ass[sort_idx]
+                eval_pos = pos[non_anchor]
+                eval_gt = gt_pos[non_anchor]
 
-                pred_ass = greedy_cost_assignment(pos, real_grid)
-                sort_idx = torch.sort(pred_ass[:, 0])[1]
+                diff = eval_pos - eval_gt
+                mse = torch.mean(diff ** 2)
+                rmse = torch.sqrt(mse)
+                mae = torch.mean(torch.abs(diff))
+                mean_dist = torch.norm(diff, dim=1).mean()
 
-                if False:
-                    pred1 = pred_ass[sort_idx][:, 1]
+                self.metrics["val_mse"].update(mse)
+                self.metrics["val_rmse"].update(rmse)
+                self.metrics["val_mae"].update(mae)
+                self.metrics["val_mean_dist"].update(mean_dist)
+                self.metrics["overall_acc"].update(-mean_dist)
 
-                    pred2 = torch.rot90(
-                        pred_ass[:, 1].view(n_patches[0], n_patches[1])
-                    ).flatten()
-                    pred3 = torch.rot90(
-                        pred2.view(n_patches[0], n_patches[1])
-                    ).flatten()
-                    pred4 = torch.rot90(
-                        pred3.view(n_patches[0], n_patches[1])
-                    ).flatten()
+                if (
+                    self.local_rank == 0
+                    and batch_idx < 10
+                    and i < min(batch.batch.max().item() + 1, 4)
+                ):
+                    save_path = Path(f"results/{self.logger.experiment.name}/val")
 
-                    preds = [pred1, pred2, pred3, pred4]
-                    correct = np.max(
-                        [
-                            (gt_ass[:, 1] == pred1).all(),
-                            (gt_ass[:, 1] == pred2).all(),
-                            (gt_ass[:, 1] == pred3).all(),
-                            (gt_ass[:, 1] == pred4).all(),
-                        ]
+                    self.save_oct_image(
+                        patches_rgb=patches_rgb,
+                        pos=pos,
+                        gt_pos=gt_pos,
+                        raw_pos=raw_pos,
+                        scan_indices=batch.scan_indices[idx],
+                        batch_ids=batch.batch_ids[idx],
+                        is_anchor=batch.is_anchor[idx],
+                        ind_name=i_name,
+                        file_name=save_path,
+                        dense_imgs=batch.dense_imgs[i],
+                        dense_scan_indices=batch.dense_scan_indices[i],
+                        dense_y=batch.dense_y[i],
+                        # xlim=batch.xlim[i],
+                        # ylim=batch.ylim[i],
+                        xlim=batch.xlim.view(-1, 2)[i],
+    ylim=batch.ylim.view(-1, 2)[i],
+                        full_width=batch.full_width[i],
+                        crop_display_width=batch.crop_display_width[i],
+                        display_height=batch.display_height[i],
+                        title_prefix="val",
                     )
-
-                    accuracy_rots = [
-                        torch.tensor(gt_ass[:, 1] == pred1),
-                        (gt_ass[:, 1] == pred2),
-                        (gt_ass[:, 1] == pred3),
-                        (gt_ass[:, 1] == pred4),
-                    ]
-                    piece_accuracy = accuracy_rots[
-                        np.argmax(
-                            [
-                                accuracy_rots[0].sum(),
-                                accuracy_rots[1].sum(),
-                                accuracy_rots[2].sum(),
-                                accuracy_rots[3].sum(),
-                            ]
-                        )
-                    ].to(self.device)
-                else:
-                    pred = pred_ass[sort_idx][:, 1]
-
-                    correct = (gt_ass[:, 1] == pred).all()
-                    piece_accuracy = torch.tensor(gt_ass[:, 1] == pred).to(self.device)
-
-                if self.rotation:
-                    pred_rot = img[idx, 2:]
-                    gt_rot = batch.x[idx, 2:]
-
-                    rot_correct = torch.cosine_similarity(pred_rot, gt_rot) > math.cos(
-                        math.pi / 4
-                    )
-                    correct = correct and rot_correct.all()
-                    piece_accuracy = rot_correct * piece_accuracy
-
-                # self.num_images += 1
-                if not self.all_equivariant:
-                    if (
-                        self.local_rank == 0
-                        and batch_idx < 10
-                        and i < min(batch.batch.max().item(), 4)
-                    ):
-                        save_path = Path(f"results/{self.logger.experiment.name}/val")
-
-                        if self.rotation:
-                            self.save_image_rotated(
-                                patches_rgb=patches_rgb,
-                                pos=pos,
-                                gt_pos=gt_pos,
-                                patches_dim=n_patches,
-                                ind_name=i_name,
-                                file_name=save_path,
-                                correct=correct,
-                                gt_rotations=gt_rot,
-                                pred_rotations=pred_rot,
-                            )
-                        else:
-                            self.save_image(
-                                patches_rgb=patches_rgb,
-                                pos=pos,
-                                gt_pos=gt_pos,
-                                patches_dim=n_patches,
-                                ind_name=i_name,
-                                file_name=save_path,
-                                correct=correct,
-                            )
-
-                self.metrics[f"{tuple(n_patches)}_nImages"].update(1)
-                self.metrics["overall_nImages"].update(1)
-                self.metrics[f"{tuple(n_patches)}__piece_acc"].update(piece_accuracy)
-                if correct:
-                    # if (assignement[:, 0] == assignement[:, 1]).all():
-                    self.metrics[f"{tuple(n_patches)}_acc"].update(1)
-                    self.metrics["overall_acc"].update(1)
-                    # accuracy_dict[tuple(n_patches)].append(1)
-                else:
-                    self.metrics[f"{tuple(n_patches)}_acc"].update(0)
-                    self.metrics["overall_acc"].update(0)
-                    # accuracy_dict[tuple(n_patches)].append(0)
 
             self.log_dict(self.metrics)
-        # return accuracy_dict
 
     def validation_epoch_end(self, outputs) -> None:
         self.log_dict(self.metrics)
@@ -909,218 +938,218 @@ class GNN_Diffusion(pl.LightningModule):
     def test_epoch_end(self, outputs) -> None:
         return self.validation_epoch_end(outputs)
 
-    # def test_step(self, batch, batch_idx, *args, **kwargs):
-    #     return self.validation_step(batch, batch_idx, *args, **kwargs)
+    def test_step(self, batch, batch_idx, *args, **kwargs):
+        return self.validation_step(batch, batch_idx)
 
-    def test_step(self, batch, batch_idx):
-        with torch.no_grad():
-            imgs, attentions = self.p_sample_loop(
-                batch.x.shape, batch.patches, batch.edge_index, batch=batch.batch
-            )
+    # def test_step(self, batch, batch_idx):
+    #     with torch.no_grad():
+    #         imgs, attentions = self.p_sample_loop(
+    #             batch.x.shape, batch.patches, batch.edge_index, batch=batch.batch
+    #         )
 
-            img = imgs[-1]
+    #         img = imgs[-1]
 
-            for i in range(batch.batch.max() + 1):
-                idx = torch.where(batch.batch == i)[0]
-                patches_rgb = batch.patches[idx]
-                gt_pos = batch.x[idx, :2]
-                pos = img[idx, :2]
-                n_patches = batch.patches_dim[i].tolist()
-                i_name = batch.ind_name[i]
+    #         for i in range(batch.batch.max() + 1):
+    #             idx = torch.where(batch.batch == i)[0]
+    #             patches_rgb = batch.patches[idx]
+    #             gt_pos = batch.x[idx, :2]
+    #             pos = img[idx, :2]
+    #             n_patches = batch.patches_dim[i].tolist()
+    #             i_name = batch.ind_name[i]
 
-                y = torch.linspace(-1, 1, n_patches[0], device=self.device)
-                x = torch.linspace(-1, 1, n_patches[1], device=self.device)
-                xy = torch.stack(torch.meshgrid(x, y, indexing="xy"), -1)
-                real_grid = einops.rearrange(xy, "x y c-> (x y) c")
+    #             y = torch.linspace(-1, 1, n_patches[0], device=self.device)
+    #             x = torch.linspace(-1, 1, n_patches[1], device=self.device)
+    #             xy = torch.stack(torch.meshgrid(x, y, indexing="xy"), -1)
+    #             real_grid = einops.rearrange(xy, "x y c-> (x y) c")
 
-                gt_ass = greedy_cost_assignment(gt_pos, real_grid)
-                sort_idx = torch.sort(gt_ass[:, 0])[1]
-                gt_ass = gt_ass[sort_idx]
+    #             gt_ass = greedy_cost_assignment(gt_pos, real_grid)
+    #             sort_idx = torch.sort(gt_ass[:, 0])[1]
+    #             gt_ass = gt_ass[sort_idx]
 
-                pred_ass = greedy_cost_assignment(pos, real_grid)
-                sort_idx = torch.sort(pred_ass[:, 0])[1]
-                pred_ass = pred_ass[sort_idx]
+    #             pred_ass = greedy_cost_assignment(pos, real_grid)
+    #             sort_idx = torch.sort(pred_ass[:, 0])[1]
+    #             pred_ass = pred_ass[sort_idx]
 
-                correct = (gt_ass[:, 1] == pred_ass[:, 1]).all()
+    #             correct = (gt_ass[:, 1] == pred_ass[:, 1]).all()
 
-                piece_accuracy = (gt_ass[:, 1] == pred_ass[:, 1]).to(self.device)
-                if self.rotation:
-                    pred_rot = img[idx, 2:]
-                    gt_rot = batch.x[idx, 2:]
+    #             piece_accuracy = (gt_ass[:, 1] == pred_ass[:, 1]).to(self.device)
+    #             if self.rotation:
+    #                 pred_rot = img[idx, 2:]
+    #                 gt_rot = batch.x[idx, 2:]
 
-                    rot_correct = torch.cosine_similarity(pred_rot, gt_rot) > math.cos(
-                        math.pi / 4
-                    )
-                    correct = correct and rot_correct.all()
-                    piece_accuracy = rot_correct * piece_accuracy
+    #                 rot_correct = torch.cosine_similarity(pred_rot, gt_rot) > math.cos(
+    #                     math.pi / 4
+    #                 )
+    #                 correct = correct and rot_correct.all()
+    #                 piece_accuracy = rot_correct * piece_accuracy
 
-                if self.save_eval_images:
-                    for id_t, t_img in enumerate(imgs):
-                        t_res = t_img[idx]
+    #             if self.save_eval_images:
+    #                 for id_t, t_img in enumerate(imgs):
+    #                     t_res = t_img[idx]
 
-                        pred_pos = t_res[:, :2]
-                        pred_rot = t_res[:, 2:]
-                        fig, ax = plt.subplots(2, 1, figsize=(10, 15))
+    #                     pred_pos = t_res[:, :2]
+    #                     pred_rot = t_res[:, 2:]
+    #                     fig, ax = plt.subplots(2, 1, figsize=(10, 15))
 
-                        img_plot = self.create_image_from_patches(
-                            patches_rgb,
-                            pred_pos,
-                            n_patches=n_patches,
-                            i=i_name,
-                            rotations=pred_rot,
-                        )
+    #                     img_plot = self.create_image_from_patches(
+    #                         patches_rgb,
+    #                         pred_pos,
+    #                         n_patches=n_patches,
+    #                         i=i_name,
+    #                         rotations=pred_rot,
+    #                     )
 
-                        ax[0].imshow(img_plot)
-                        # ax[0].set_axis_off()
-                        ax[0].set_xticks([])
-                        ax[0].set_yticks([])
+    #                     ax[0].imshow(img_plot)
+    #                     # ax[0].set_axis_off()
+    #                     ax[0].set_xticks([])
+    #                     ax[0].set_yticks([])
 
-                        # ax[0].patch.set_edgecolor("black")
+    #                     # ax[0].patch.set_edgecolor("black")
 
-                        # ax[0].patch.set_linewidth("1")
+    #                     # ax[0].patch.set_linewidth("1")
 
-                        col = list(map(interpolate_color, gt_pos))
-                        pred_rot = F.normalize(pred_rot, dim=-1)
+    #                     col = list(map(interpolate_color, gt_pos))
+    #                     pred_rot = F.normalize(pred_rot, dim=-1)
 
-                        rad_pred = torch.atan2(pred_rot[:, 1], pred_rot[:, 0])
-                        rad_gt = torch.atan2(gt_rot[:, 1], gt_rot[:, 0])
+    #                     rad_pred = torch.atan2(pred_rot[:, 1], pred_rot[:, 0])
+    #                     rad_gt = torch.atan2(gt_rot[:, 1], gt_rot[:, 0])
 
-                        diff_rad = (rad_gt - rad_pred) + math.pi / 2
-                        new_p = torch.stack(
-                            [torch.cos(diff_rad), torch.sin(diff_rad)], dim=-1
-                        )
+    #                     diff_rad = (rad_gt - rad_pred) + math.pi / 2
+    #                     new_p = torch.stack(
+    #                         [torch.cos(diff_rad), torch.sin(diff_rad)], dim=-1
+    #                     )
 
-                        ax[1].quiver(
-                            pred_pos[:, 0].cpu(),
-                            pred_pos[:, 1].cpu(),
-                            new_p[:, 0].cpu(),
-                            new_p[:, 1].cpu(),
-                            color=col,
-                            pivot="middle",
-                            scale=10,
-                            width=0.01,
-                        )
+    #                     ax[1].quiver(
+    #                         pred_pos[:, 0].cpu(),
+    #                         pred_pos[:, 1].cpu(),
+    #                         new_p[:, 0].cpu(),
+    #                         new_p[:, 1].cpu(),
+    #                         color=col,
+    #                         pivot="middle",
+    #                         scale=10,
+    #                         width=0.01,
+    #                     )
 
-                        ax[1].set_aspect("equal")
-                        # ax[1].set_axis_off()
-                        ax[1].set_xlim(-1.2, 1.2)
-                        ax[1].set_ylim(-1.2, 1.2)
+    #                     ax[1].set_aspect("equal")
+    #                     # ax[1].set_axis_off()
+    #                     ax[1].set_xlim(-1.2, 1.2)
+    #                     ax[1].set_ylim(-1.2, 1.2)
 
-                        ax[1].invert_yaxis()
-                        # ax[1].patch.set_edgecolor("black")
+    #                     ax[1].invert_yaxis()
+    #                     # ax[1].patch.set_edgecolor("black")
 
-                        # ax[1].patch.set_linewidth("1")
+    #                     # ax[1].patch.set_linewidth("1")
 
-                        ax[1].set_xticks([])
-                        ax[1].set_yticks([])
+    #                     ax[1].set_xticks([])
+    #                     ax[1].set_yticks([])
 
-                        save_path = f"results/{self.logger.experiment.name}/test/"
-                        save_path = Path(save_path)
-                        save_path.mkdir(parents=True, exist_ok=True)
-                        fig.savefig(
-                            save_path / f"{i_name}_{id_t:03d}.png",
-                            dpi=300,
-                            transparent=True,
-                        )
-                        plt.close(fig)
+    #                     save_path = f"results/{self.logger.experiment.name}/test/"
+    #                     save_path = Path(save_path)
+    #                     save_path.mkdir(parents=True, exist_ok=True)
+    #                     fig.savefig(
+    #                         save_path / f"{i_name}_{id_t:03d}.png",
+    #                         dpi=300,
+    #                         transparent=True,
+    #                     )
+    #                     plt.close(fig)
 
-                    ###### FINAL IMAGE ######
+    #                 ###### FINAL IMAGE ######
 
-                    # pred_pos = t_res[:, :2]
-                    pred_rot = t_res[:, 2:]
+    #                 # pred_pos = t_res[:, :2]
+    #                 pred_rot = t_res[:, 2:]
 
-                    # for the final image use the gt pos, sorted by the predicted assignement
-                    # pred_pos = gt_pos[pred_ass[:, 1]]
-                    pred_pos = real_grid[pred_ass[:, 1]]
+    #                 # for the final image use the gt pos, sorted by the predicted assignement
+    #                 # pred_pos = gt_pos[pred_ass[:, 1]]
+    #                 pred_pos = real_grid[pred_ass[:, 1]]
 
-                    # snap the rotation to one of the four 90 degree rotations
-                    rad = torch.atan2(pred_rot[:, 1], pred_rot[:, 0])
-                    rad_snap = torch.round(rad / (torch.pi / 2)) * torch.pi / 2
+    #                 # snap the rotation to one of the four 90 degree rotations
+    #                 rad = torch.atan2(pred_rot[:, 1], pred_rot[:, 0])
+    #                 rad_snap = torch.round(rad / (torch.pi / 2)) * torch.pi / 2
 
-                    pred_rot = torch.stack(
-                        [torch.cos(rad_snap), torch.sin(rad_snap)], dim=-1
-                    )
+    #                 pred_rot = torch.stack(
+    #                     [torch.cos(rad_snap), torch.sin(rad_snap)], dim=-1
+    #                 )
 
-                    fig, ax = plt.subplots(2, 1, figsize=(10, 15))
+    #                 fig, ax = plt.subplots(2, 1, figsize=(10, 15))
 
-                    img_plot = self.create_image_from_patches(
-                        patches_rgb,
-                        pred_pos,
-                        n_patches=n_patches,
-                        i=i_name,
-                        rotations=pred_rot,
-                    )
+    #                 img_plot = self.create_image_from_patches(
+    #                     patches_rgb,
+    #                     pred_pos,
+    #                     n_patches=n_patches,
+    #                     i=i_name,
+    #                     rotations=pred_rot,
+    #                 )
 
-                    ax[0].imshow(img_plot)
-                    # ax[0].set_axis_off()
-                    ax[0].set_xticks([])
-                    ax[0].set_yticks([])
+    #                 ax[0].imshow(img_plot)
+    #                 # ax[0].set_axis_off()
+    #                 ax[0].set_xticks([])
+    #                 ax[0].set_yticks([])
 
-                    # ax[0].patch.set_edgecolor("black")
+    #                 # ax[0].patch.set_edgecolor("black")
 
-                    # ax[0].patch.set_linewidth("1")
+    #                 # ax[0].patch.set_linewidth("1")
 
-                    col = list(map(interpolate_color, gt_pos))
-                    pred_rot = F.normalize(pred_rot, dim=-1)
+    #                 col = list(map(interpolate_color, gt_pos))
+    #                 pred_rot = F.normalize(pred_rot, dim=-1)
 
-                    rad_pred = torch.atan2(pred_rot[:, 1], pred_rot[:, 0])
-                    rad_gt = torch.atan2(gt_rot[:, 1], gt_rot[:, 0])
+    #                 rad_pred = torch.atan2(pred_rot[:, 1], pred_rot[:, 0])
+    #                 rad_gt = torch.atan2(gt_rot[:, 1], gt_rot[:, 0])
 
-                    diff_rad = (rad_gt - rad_pred) + math.pi / 2
-                    new_p = torch.stack(
-                        [torch.cos(diff_rad), torch.sin(diff_rad)], dim=-1
-                    )
+    #                 diff_rad = (rad_gt - rad_pred) + math.pi / 2
+    #                 new_p = torch.stack(
+    #                     [torch.cos(diff_rad), torch.sin(diff_rad)], dim=-1
+    #                 )
 
-                    ax[1].quiver(
-                        pred_pos[:, 0].cpu(),
-                        pred_pos[:, 1].cpu(),
-                        new_p[:, 0].cpu(),
-                        new_p[:, 1].cpu(),
-                        color=col,
-                        pivot="middle",
-                        scale=10,
-                        width=0.01,
-                    )
+    #                 ax[1].quiver(
+    #                     pred_pos[:, 0].cpu(),
+    #                     pred_pos[:, 1].cpu(),
+    #                     new_p[:, 0].cpu(),
+    #                     new_p[:, 1].cpu(),
+    #                     color=col,
+    #                     pivot="middle",
+    #                     scale=10,
+    #                     width=0.01,
+    #                 )
 
-                    ax[1].set_aspect("equal")
-                    # ax[1].set_axis_off()
-                    ax[1].set_xlim(-1.2, 1.2)
-                    ax[1].set_ylim(-1.2, 1.2)
+    #                 ax[1].set_aspect("equal")
+    #                 # ax[1].set_axis_off()
+    #                 ax[1].set_xlim(-1.2, 1.2)
+    #                 ax[1].set_ylim(-1.2, 1.2)
 
-                    ax[1].invert_yaxis()
-                    # ax[1].patch.set_edgecolor("black")
+    #                 ax[1].invert_yaxis()
+    #                 # ax[1].patch.set_edgecolor("black")
 
-                    # ax[1].patch.set_linewidth("1")
+    #                 # ax[1].patch.set_linewidth("1")
 
-                    ax[1].set_xticks([])
-                    ax[1].set_yticks([])
+    #                 ax[1].set_xticks([])
+    #                 ax[1].set_yticks([])
 
-                    save_path = f"results/{self.logger.experiment.name}/test/"
-                    save_path = Path(save_path)
-                    save_path.mkdir(parents=True, exist_ok=True)
-                    fig.savefig(
-                        save_path / f"{i_name}_final.png",
-                        dpi=300,
-                        transparent=True,
-                    )
-                    plt.close(fig)
+    #                 save_path = f"results/{self.logger.experiment.name}/test/"
+    #                 save_path = Path(save_path)
+    #                 save_path.mkdir(parents=True, exist_ok=True)
+    #                 fig.savefig(
+    #                     save_path / f"{i_name}_final.png",
+    #                     dpi=300,
+    #                     transparent=True,
+    #                 )
+    #                 plt.close(fig)
 
-                    #######################
+    #                 #######################
 
-                self.metrics[f"{tuple(n_patches)}_nImages"].update(1)
-                self.metrics["overall_nImages"].update(1)
-                self.metrics[f"{tuple(n_patches)}__piece_acc"].update(piece_accuracy)
-                if correct:
-                    # if (assignement[:, 0] == assignement[:, 1]).all():
-                    self.metrics[f"{tuple(n_patches)}_acc"].update(1)
-                    self.metrics["overall_acc"].update(1)
-                    # accuracy_dict[tuple(n_patches)].append(1)
-                else:
-                    self.metrics[f"{tuple(n_patches)}_acc"].update(0)
-                    self.metrics["overall_acc"].update(0)
-                    # accuracy_dict[tuple(n_patches)].append(0)
+    #             self.metrics[f"{tuple(n_patches)}_nImages"].update(1)
+    #             self.metrics["overall_nImages"].update(1)
+    #             self.metrics[f"{tuple(n_patches)}__piece_acc"].update(piece_accuracy)
+    #             if correct:
+    #                 # if (assignement[:, 0] == assignement[:, 1]).all():
+    #                 self.metrics[f"{tuple(n_patches)}_acc"].update(1)
+    #                 self.metrics["overall_acc"].update(1)
+    #                 # accuracy_dict[tuple(n_patches)].append(1)
+    #             else:
+    #                 self.metrics[f"{tuple(n_patches)}_acc"].update(0)
+    #                 self.metrics["overall_acc"].update(0)
+    #                 # accuracy_dict[tuple(n_patches)].append(0)
 
-            self.log_dict(self.metrics)
+    #         self.log_dict(self.metrics)
 
         # return self.validation_step(batch, batch_idx)
         # all_outs = self.all_gather(outputs)
@@ -1164,7 +1193,7 @@ class GNN_Diffusion(pl.LightningModule):
     def predict_step(self, batch, batch_idx):
         with torch.no_grad():
             preds = self.p_sample_loop(
-                batch.x.shape, batch.patches, batch.edge_index, batch=batch.batch
+                batch.x.shape, batch.patches, batch.edge_index, batch=batch.batch, is_anchor=batch.is_anchor,
             )
 
             for i in range(batch.batch.max() + 1):
@@ -1201,178 +1230,332 @@ class GNN_Diffusion(pl.LightningModule):
                         correct=correct,
                     )
 
-    def create_image_from_patches(
-        self, patches, pos, n_patches=(4, 4), i=0, rotations=None
+    def oct_patch_to_numpy(self, patch):
+        # patch: [3, H, W], already normalized 0..1 from dataset
+        img = patch[0].detach().cpu().numpy().astype(np.float32)
+        return np.clip(img, 0.0, 1.0)
+
+    def add_oct_patch(
+        self,
+        ax,
+        patch,
+        x_center,
+        y_center,
+        display_height=0.55,
+        crop_width=0.20,
+        alpha_floor=0.10,
+        zorder=2,
     ):
-        patch_size = 32
-        height = patch_size * n_patches[0]
-        width = patch_size * n_patches[1]
-        new_image = Image.new("RGBA", (width, height))
-        for p in range(patches.shape[0]):
-            patch = patches[p, :]
-            patch = Image.fromarray(
-                ((patch.permute(1, 2, 0)) * 255).cpu().numpy().astype(np.uint8)
+        img = self.oct_patch_to_numpy(patch)
+
+        alpha = np.clip((img - alpha_floor) / (1.0 - alpha_floor), 0, 1)
+
+        ax.imshow(
+            img,
+            cmap="gray",
+            extent=[
+                x_center - crop_width / 2,
+                x_center + crop_width / 2,
+                y_center - display_height / 2,
+                y_center + display_height / 2,
+            ],
+            aspect="auto",
+            alpha=alpha,
+            zorder=zorder,
+        )
+
+    def save_oct_image(
+        self,
+        patches_rgb,
+        pos,
+        gt_pos,
+        raw_pos,
+        scan_indices,
+        batch_ids,
+        is_anchor,
+        ind_name,
+        file_name: Path,
+        dense_imgs,
+        dense_scan_indices,
+        dense_y,
+        xlim,
+        ylim,
+        full_width,
+        crop_display_width,
+        display_height,
+        title_prefix="train",
+    ):
+        file_name.mkdir(parents=True, exist_ok=True)
+
+        patches_rgb = patches_rgb.detach().cpu()
+        pos = pos.detach().cpu()
+        gt_pos = gt_pos.detach().cpu()
+        raw_pos = raw_pos.detach().cpu()
+        scan_indices = scan_indices.detach().cpu().view(-1)
+        batch_ids = batch_ids.detach().cpu().view(-1)
+        is_anchor = is_anchor.detach().cpu().bool().view(-1)
+
+        dense_imgs = dense_imgs.detach().cpu()
+        dense_scan_indices = dense_scan_indices.detach().cpu().view(-1)
+        dense_y = dense_y.detach().cpu().view(-1)
+
+        raw_xlim = xlim.detach().cpu().view(-1).tolist()
+        raw_ylim = ylim.detach().cpu().view(-1).tolist()
+        raw_xlim = [float(raw_xlim[0]), float(raw_xlim[1])]
+        raw_ylim = [float(raw_ylim[0]), float(raw_ylim[1])]
+
+        full_width = float(full_width.detach().cpu().view(-1)[0])
+        crop_display_width = float(crop_display_width.detach().cpu().view(-1)[0])
+        display_height = float(display_height.detach().cpu().view(-1)[0])
+
+        # Use only ground truth to define anchored plot limits.
+        # Random epoch-0 predictions should not resize all the plots.
+        # gt_x_min = float(gt_pos[:, 0].min())
+        # gt_x_max = float(gt_pos[:, 0].max())
+        # gt_y_min = float(gt_pos[:, 1].min())
+        # gt_y_max = float(gt_pos[:, 1].max())
+
+        # anchored_x_pad = max(crop_display_width, 0.05)
+        # anchored_y_pad = max(display_height / 2, 0.20)
+
+        # anchored_xlim = [
+        #     gt_x_min - anchored_x_pad,
+        #     gt_x_max + anchored_x_pad,
+        # ]
+
+        # anchored_ylim = [
+        #     gt_y_min - anchored_y_pad,
+        #     gt_y_max + anchored_y_pad,
+        # ]
+        
+        raw_x_span = raw_xlim[1] - raw_xlim[0]
+        raw_y_span = raw_ylim[1] - raw_ylim[0]
+
+        needed_x_min = min(float(gt_pos[:, 0].min()) - crop_display_width / 2, 0.0)
+        needed_x_max = max(float(gt_pos[:, 0].max()) + crop_display_width / 2, 0.0)
+        needed_y_min = min(float(gt_pos[:, 1].min()) - display_height / 2, 0.0)
+        needed_y_max = max(float(gt_pos[:, 1].max()) + display_height / 2, 0.0)
+
+        anchored_x_span = max(raw_x_span, needed_x_max - needed_x_min)
+        anchored_y_span = max(raw_y_span, needed_y_max - needed_y_min)
+
+        anchored_x_center = (needed_x_min + needed_x_max) / 2
+        anchored_y_center = (needed_y_min + needed_y_max) / 2
+
+        anchored_xlim = [anchored_x_center - anchored_x_span / 2, anchored_x_center + anchored_x_span / 2]
+        anchored_ylim = [anchored_y_center - anchored_y_span / 2, anchored_y_center + anchored_y_span / 2]
+        fig, axes = plt.subplots(1, 4, figsize=(24, 12))
+
+        # panel 1 -> dense-volume projection in original pixel space
+        # no width_stretch, display_height, or recon XY
+        ax = axes[0]
+
+        for j in range(dense_imgs.shape[0]):
+            y_center = float(dense_y[j])
+
+            self.add_oct_patch(
+                ax=ax,
+                patch=dense_imgs[j],
+                x_center=0.0,
+                y_center=y_center,
+                display_height=display_height,
+                crop_width=full_width,
+                alpha_floor=0.10,
+                zorder=1,
             )
 
-            # patch_pad = ImageOps.pad(
-            #     patch, (46, 46), color=(0, 0, 0, 0), centering=(0.5, 0.5)
-            # )
-            patch = patch.convert("RGBA")
-            patch_pad = ImageOps.expand(patch, border=7, fill=(0, 0, 0, 0))
-            if rotations is not None:
-                deg_angle = (
-                    torch.arctan2(rotations[p, 1], rotations[p, 0]) / torch.pi * 180
-                )
-                patch_pad = patch_pad.rotate(-deg_angle, fillcolor=(0, 0, 0, 0))
+            ax.text(
+                raw_xlim[0],
+                y_center,
+                str(int(dense_scan_indices[j])),
+                ha="right",
+                va="center",
+                fontsize=6,
+            )
 
-            x = pos[p, 0] * (1 - 1 / n_patches[0])
-            y = pos[p, 1] * (1 - 1 / n_patches[1])
-            x_pos = int((x + 1) * width / 2) - 23  # patch_size // 2
-            y_pos = int((y + 1) * height / 2) - 23  # patch_size // 2
-            new_image.paste(patch_pad, (x_pos, y_pos), patch_pad)
+        ax.set_xlim(raw_xlim)
+        ax.set_ylim(raw_ylim)
+        ax.grid(alpha=0.3)
+        ax.set_title("Dense volume")
+        ax.set_xlabel("Full scan width")
+        ax.set_ylabel("Scan position")
 
-        return new_image
+        # panel 2 -> crops in the original reconstruction coordinates
+        ax = axes[1]
 
-    def save_image(
-        self,
-        patches_rgb,
-        pos,
-        gt_pos,
-        patches_dim,
-        ind_name,
-        file_name: Path,
-        correct=None,
-    ):
-        file_name.mkdir(parents=True, exist_ok=True)
+        for p in range(patches_rgb.shape[0]):
+            self.add_oct_patch(
+                ax=ax,
+                patch=patches_rgb[p],
+                x_center=float(raw_pos[p, 0]),
+                y_center=float(raw_pos[p, 1]),
+                display_height=display_height,
+                crop_width=crop_display_width,
+                alpha_floor=0.10,
+                zorder=2,
+            )
 
-        fig, ax = plt.subplots(2, 2)
+            marker = "*" if is_anchor[p] else "x"
+            marker_size = 100 if is_anchor[p] else 35
 
-        gt_img = self.create_image_from_patches(
-            patches_rgb, gt_pos, n_patches=patches_dim, i=ind_name
+            ax.scatter(
+                float(raw_pos[p, 0]),
+                float(raw_pos[p, 1]),
+                s=marker_size,
+                marker=marker,
+                zorder=10,
+            )
+
+            ax.text(
+                float(raw_pos[p, 0]) + 0.005,
+                float(raw_pos[p, 1]),
+                "s{} b{}".format(int(scan_indices[p]), int(batch_ids[p])),
+                fontsize=6,
+                va="center",
+                zorder=11,
+            )
+
+        ax.set_xlim(raw_xlim)
+        ax.set_ylim(raw_ylim)
+        ax.grid(alpha=0.3)
+        ax.set_title("Original crop positions")
+        ax.set_xlabel("Original x")
+        ax.set_ylabel("Original y")
+
+        # panel 3 -> anchor-relative ground truth
+        ax = axes[2]
+
+        for p in range(patches_rgb.shape[0]):
+            self.add_oct_patch(
+                ax=ax,
+                patch=patches_rgb[p],
+                x_center=float(gt_pos[p, 0]),
+                y_center=float(gt_pos[p, 1]),
+                display_height=display_height,
+                crop_width=crop_display_width,
+                alpha_floor=0.10,
+                zorder=2,
+            )
+
+            marker = "*" if is_anchor[p] else "x"
+            marker_size = 100 if is_anchor[p] else 35
+
+            ax.scatter(
+                float(gt_pos[p, 0]),
+                float(gt_pos[p, 1]),
+                s=marker_size,
+                marker=marker,
+                zorder=10,
+            )
+
+            ax.text(
+                float(gt_pos[p, 0]) + 0.005,
+                float(gt_pos[p, 1]),
+                "s{} b{}".format(int(scan_indices[p]), int(batch_ids[p])),
+                fontsize=6,
+                va="center",
+                zorder=11,
+            )
+
+        ax.axhline(0.0, color="black", linewidth=1.8, alpha=0.9, zorder=0)
+        ax.axvline(0.0, color="black", linewidth=1.8, alpha=0.9, zorder=0)
+        ax.grid(alpha=0.15)
+        ax.set_xlim(anchored_xlim)
+        ax.set_ylim(anchored_ylim)
+        ax.grid(alpha=0.3)
+        ax.set_title("Ground truth after anchor translation")
+        ax.set_xlabel("Anchor-relative x")
+        ax.set_ylabel("Anchor-relative y")
+
+        # panel 4: current diffusion prediction
+        ax = axes[3]
+
+        for p in range(patches_rgb.shape[0]):
+            self.add_oct_patch(
+                ax=ax,
+                patch=patches_rgb[p],
+                x_center=float(pos[p, 0]),
+                y_center=float(pos[p, 1]),
+                display_height=display_height,
+                crop_width=crop_display_width,
+                alpha_floor=0.10,
+                zorder=2,
+            )
+
+            marker = "*" if is_anchor[p] else "x"
+            marker_size = 100 if is_anchor[p] else 35
+
+            ax.scatter(
+                float(pos[p, 0]),
+                float(pos[p, 1]),
+                s=marker_size,
+                marker=marker,
+                zorder=10,
+            )
+
+            ax.text(
+                float(pos[p, 0]) + 0.005,
+                float(pos[p, 1]),
+                "s{} b{}".format(int(scan_indices[p]), int(batch_ids[p])),
+                fontsize=6,
+                va="center",
+                zorder=11,
+            )
+
+        ax.axhline(0.0, color="black", linewidth=1.8, alpha=0.9, zorder=0)
+        ax.axvline(0.0, color="black", linewidth=1.8, alpha=0.9, zorder=0)
+        ax.grid(alpha=0.15)
+
+        # Use the same limits as the ground-truth panel for direct comparison.
+        ax.set_xlim(anchored_xlim)
+        ax.set_ylim(anchored_ylim)
+        ax.grid(alpha=0.3)
+        ax.set_title("Current diffusion state")
+        ax.set_xlabel("Anchor-relative x")
+        ax.set_ylabel("Anchor-relative y")
+
+        non_anchor = ~is_anchor
+
+        if non_anchor.any():
+            mean_dist = torch.norm(
+                pos[non_anchor, :2] - gt_pos[non_anchor, :2],
+                dim=1,
+            ).mean().item()
+        else:
+            mean_dist = 0.0
+
+        sample_id = int(ind_name.detach().cpu().view(-1)[0])
+
+        fig.suptitle(
+            "{} epoch {} sample {} mean_dist {:.4f}".format(
+                title_prefix,
+                self.current_epoch,
+                sample_id,
+                mean_dist,
+            )
         )
-        # assignement = greedy_cost_assignment(pos, gt_pos)
 
-        pred_img = self.create_image_from_patches(
-            patches_rgb, pos, n_patches=patches_dim, i=ind_name
+        plt.tight_layout()
+
+        out_path = file_name / "oct_epoch{}_sample{}.png".format(
+            self.current_epoch,
+            sample_id,
         )
-        col = list(map(interpolate_color, gt_pos))
-        ax[0, 0].imshow(gt_img)
-        ax[0, 1].imshow(pred_img)
-        ax[1, 0].scatter(gt_pos[:, 0].cpu(), gt_pos[:, 1].cpu(), c=col)
-        ax[1, 0].invert_yaxis()
-        ax[1, 0].set_aspect("equal")
-
-        ax[1, 1].scatter(pos[:, 0].cpu(), pos[:, 1].cpu(), c=col)
-
-        ax[1, 1].invert_yaxis()
-        ax[1, 1].set_aspect("equal")
-        ax[0, 0].set_title(f"{self.current_epoch}-{ind_name}- correct:{correct}")
-
-        ax[0, 1].set_title(f"{patches_dim}")
 
         fig.canvas.draw()
+
         im = PIL.Image.frombytes(
-            "RGB", fig.canvas.get_width_height(), fig.canvas.tostring_rgb()
+            "RGB",
+            fig.canvas.get_width_height(),
+            fig.canvas.tostring_rgb(),
         )
-        im = wandb.Image(im)
+
         self.logger.experiment.log(
-            {f"{file_name.stem}": im, "global_step": self.global_step}
+            {
+                f"{file_name.stem}_oct": wandb.Image(im),
+                "global_step": self.global_step,
+            }
         )
 
-        plt.savefig(f"{file_name}/asd_{self.current_epoch}-{ind_name}.png")
-        plt.close()
-
-    def save_image_rotated(
-        self,
-        patches_rgb,
-        pos,
-        gt_pos,
-        patches_dim,
-        ind_name,
-        file_name: Path,
-        gt_rotations,
-        pred_rotations,
-        correct=None,
-    ):
-        file_name.mkdir(parents=True, exist_ok=True)
-
-        fig, ax = plt.subplots(2, 3)
-
-        # patches_rgb = patches_rgb[:, 0, :]
-        gt_img_correct = self.create_image_from_patches(
-            patches_rgb,
-            gt_pos,
-            n_patches=patches_dim,
-            i=ind_name,
-            rotations=gt_rotations,
-        )
-
-        gt_img = self.create_image_from_patches(
-            patches_rgb,
-            gt_pos,
-            n_patches=patches_dim,
-            i=ind_name,
-        )
-
-        gt_img = self.create_image_from_patches(
-            patches_rgb,
-            gt_pos,
-            n_patches=patches_dim,
-            i=ind_name,
-        )
-        # assignement = greedy_cost_assignment(pos, gt_pos)
-
-        pred_img = self.create_image_from_patches(
-            patches_rgb,
-            pos,
-            n_patches=patches_dim,
-            i=ind_name,
-            rotations=pred_rotations,
-        )
-        col = list(map(interpolate_color, gt_pos))
-
-        ax[0, 0].imshow(gt_img_correct)
-        ax[0, 1].imshow(gt_img)
-        ax[0, 2].imshow(pred_img)
-
-        ax[1, 1].quiver(
-            gt_pos[:, 0].cpu(),
-            gt_pos[:, 1].cpu(),
-            gt_rotations[:, 0].cpu(),
-            gt_rotations[:, 1].cpu(),
-            color=col,
-            pivot="middle",
-            scale=10,
-            width=0.01,
-        )
-        ax[1, 1].invert_yaxis()
-        ax[1, 1].set_aspect("equal")
-
-        ax[1, 2].quiver(
-            pos[:, 0].cpu(),
-            pos[:, 1].cpu(),
-            pred_rotations[:, 0].cpu(),
-            pred_rotations[:, 1].cpu(),
-            color=col,
-            pivot="middle",
-            scale=10,
-            width=0.01,
-        )
-
-        ax[1, 2].invert_yaxis()
-        ax[1, 2].set_aspect("equal")
-        ax[0, 0].set_title(f"{self.current_epoch}-{ind_name}- correct:{correct}")
-
-        ax[0, 1].set_title(f"{patches_dim}")
-
-        fig.canvas.draw()
-        im = PIL.Image.frombytes(
-            "RGB", fig.canvas.get_width_height(), fig.canvas.tostring_rgb()
-        )
-        im = wandb.Image(im)
-        self.logger.experiment.log(
-            {f"{file_name.stem}": im, "global_step": self.global_step}
-        )
-
-        plt.savefig(f"{file_name}/asd_{self.current_epoch}-{ind_name}.png")
-        plt.close()
+        plt.savefig(out_path, dpi=300)
+        plt.close(fig)

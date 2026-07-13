@@ -1,20 +1,19 @@
-experiment_name: "oct_vis"
+experiment_name: oct_overfit_unfreeze_backbone_spatial_map
 
-batch_size: 16
+batch_size: 1
 gpus: 1
-steps: 300
-num_workers: 8
+steps: 1
+num_workers: 4
 max_epochs: 1000
 
+learning_rate: 1e-4
+
 dataset: oct
-oct_root: /data/jeanine/Diffassemble/
-target_num_slices: 97
-train_num_volumes: 10
-image_size: [224, 224]
-row_group_size: 2
+oct_root: /home/jeanine/DiffAssemble/datasets/rl-whole-eye/processed_data
+train_num_volumes: 1
 
 sampling: DDIM
-inference_ratio: 10
+inference_ratio: 1
 
 offline: true
 wandb_id: null
@@ -23,13 +22,13 @@ classifier_free_w: 0.2
 classifier_free_prob: 0.0
 data_augmentation: none
 checkpoint_path: ""
-noise_weight: 0.0
+noise_weight: 1.0
 
-predict_xstart: true  # predict xstart instead of noise, match paper "We train DiffAssemble to predict Xˆ0 instead of Xˆt−1"
+predict_xstart: true
 rotation: false
 only_rotation: false
 
-freeze_backbone: true
+freeze_backbone: false
 visual_pretrained: true
 discrete: false
 backbone: efficientnet_b0
@@ -41,3 +40,10 @@ virt_nodes: 4
 inf_fully: false
 acc_grad: 0
 save_eval_images: false
+
+dense_size: 30
+crop_l: 120
+min_num_batches: 4
+max_num_batches: 4
+min_batch_size: 3
+max_batch_size: 3

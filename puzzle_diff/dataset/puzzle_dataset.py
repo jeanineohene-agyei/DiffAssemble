@@ -1,6 +1,5 @@
 import math
-import random
-from typing import List, Tuple
+from typing import List
 
 import einops
 import networkx as nx
@@ -8,26 +7,15 @@ import numpy as np
 import torch
 import torch_geometric as pyg
 import torch_geometric.data as pyg_data
-import torch_geometric.loader
 import torchvision.transforms as transforms
-from PIL import Image
-from PIL.Image import Resampling
 from scipy.sparse.linalg import eigsh
 from torch import Tensor
-from torch_geometric.data import Data
-from torch_geometric.data.datapipes import functional_transform
-from torch_geometric.transforms import BaseTransform
 from torch_geometric.utils import get_laplacian, to_scipy_sparse_matrix
 from torchvision.transforms import InterpolationMode
 from torchvision.transforms import functional as F
 
 # import albumentations
 # import cv2
-
-
-
-
-
 
 
 def generate_random_expander(num_nodes, degree, rng=None, max_num_iters=5, exp_index=0):
@@ -300,415 +288,392 @@ class Puzzle_Dataset(pyg_data.Dataset):
         return data
 
 
-class Puzzle_Dataset_Pad(Puzzle_Dataset):
+class OCTPuzzleDataset(pyg_data.Dataset):
     def __init__(
         self,
-        dataset=None,
-        dataset_get_fn=None,
-        patch_per_dim=[(7, 6)],
-        patch_size=32,
-        padding=0,
-        augment=False,
+        bscan_paths,
+        seg_paths,
+        dense_size=30,
+        min_num_batches=2,
+        max_num_batches=8,
+        min_batch_size=3,
+        max_batch_size=3,
+        crop_l=220,
+        valid_scan_start=50,
+        valid_scan_end=200,
+        margin_y=40,
+        margin_x_left=260,
+        margin_x_right=260,
+        min_mask_pixels=500,
+        display_height=0.55,
+        scan_spacing=0.10,
+        width_stretch=0.8,
         degree=-1,
-        unique_graph=None,
-    ) -> None:
-        super().__init__(
-            dataset=dataset,
-            dataset_get_fn=dataset_get_fn,
-            patch_per_dim=patch_per_dim,
-            patch_size=patch_size,
-            augment=augment,
-            degree=degree,
-            unique_graph=unique_graph,
-        )
-        self.padding = padding
+        seed=42,
+    ):
+        super().__init__()
+        import tifffile as tiff
 
-    def zero_margin(self, tensor):
-        # Set the border elements of each batch image to zero
-        tensor[:, :, : self.padding, :] = 0  # Top rows
-        tensor[:, :, -self.padding :, :] = 0  # Bottom rows
-        tensor[:, :, :, : self.padding] = 0  # Leftmost columns
-        tensor[:, :, :, -self.padding :] = 0  # Rightmost columns
+        self.tiff = tiff
+        self.bscan_paths = list(bscan_paths)
+        self.seg_paths = list(seg_paths)
+        assert len(self.bscan_paths) == len(self.seg_paths)
+
+        self.dense_size = dense_size
+        self.min_num_batches = min_num_batches
+        self.max_num_batches = max_num_batches
+        self.min_batch_size = min_batch_size
+        self.max_batch_size = max_batch_size
+        self.crop_l = crop_l
+
+        self.valid_scan_start = valid_scan_start
+        self.valid_scan_end = valid_scan_end
+        self.margin_y = margin_y
+        self.margin_x_left = margin_x_left
+        self.margin_x_right = margin_x_right
+        self.min_mask_pixels = min_mask_pixels
+
+        self.display_height = display_height
+        self.scan_spacing = scan_spacing
+        self.width_stretch = width_stretch
+        self.degree = degree
+        if seed is None:
+            self.seed = np.random.SeedSequence().generate_state(1)[0].item()
+        else:
+            self.seed = seed
+
+    def len(self):
+        return len(self.bscan_paths)
+
+    def norm_img(self, img):
+        img = img.astype(np.float32)
+        lo, hi = np.percentile(img, [1, 99])
+        return np.clip((img - lo) / (hi - lo + 1e-8), 0, 1)
+
+    def rotate_volume(self, vol):
+        return np.rot90(vol, k=3, axes=(1, 2)).copy()
+
+    def global_anatomy_crop(self, stack, seg):
+        mask = seg > 0
+        rows = np.where(mask.any(axis=(0, 2)))[0]
+        cols = np.where(mask.any(axis=(0, 1)))[0]
+
+        r0 = max(0, rows[0] - self.margin_y)
+        r1 = min(stack.shape[1], rows[-1] + self.margin_y)
+        c0 = max(0, cols[0] - self.margin_x_left)
+        c1 = min(stack.shape[2], cols[-1] + self.margin_x_right)
+
+        return stack[:, r0:r1, c0:c1], seg[:, r0:r1, c0:c1]
+
+    def full_display_width(self, full_shape):
+        H, W = full_shape
+        return self.display_height * (W / H) * self.width_stretch
+
+    def col_to_full_x(self, col, full_shape):
+        H, W = full_shape
+        width = self.full_display_width(full_shape)
+        return ((col / (W - 1)) - 0.5) * width
+
+    def pixel_to_display_xy(self, row, col, y_scan, full_shape):
+        H, W = full_shape
+        x = self.col_to_full_x(col, full_shape)
+        y = y_scan + (0.5 - (row / (H - 1))) * self.display_height
+        return x, y
+
+    def anatomy_center_pixels(self, img, seg):
+        m = seg > 0
+
+        if m.sum() < self.min_mask_pixels:
+            threshold = np.percentile(img.astype(np.float32), 90)
+            m = img > threshold
+
+        rr, cc = np.where(m)
+        if len(rr) == 0:
+            return None
+
+        return rr.mean(), cc.mean()
+
+    def contiguous_ranges(self, indices):
+        if len(indices) == 0:
+            return []
+
+        ranges = []
+        start = prev = int(indices[0])
+
+        for idx in indices[1:]:
+            idx = int(idx)
+            if idx == prev + 1:
+                prev = idx
+            else:
+                ranges.append((start, prev))
+                start = prev = idx
+
+        ranges.append((start, prev))
+        return ranges
+
+    def fill_small_gaps(self, valid_mask, max_gap=1):
+        valid_mask = valid_mask.copy()
+        n = len(valid_mask)
+        i = 0
+
+        while i < n:
+            if valid_mask[i]:
+                i += 1
+                continue
+
+            gap_start = i
+            while i < n and not valid_mask[i]:
+                i += 1
+            gap_end = i - 1
+
+            gap_len = gap_end - gap_start + 1
+            has_left = gap_start > 0 and valid_mask[gap_start - 1]
+            has_right = gap_end < n - 1 and valid_mask[gap_end + 1]
+
+            if has_left and has_right and gap_len <= max_gap:
+                valid_mask[gap_start:gap_end + 1] = True
+
+        return valid_mask
+
+    def best_valid_scan_range(self, seg):
+        counts = np.sum(seg > 0, axis=(1, 2))
+        peak = int(counts.max())
+
+        threshold = max(
+            self.min_mask_pixels,
+            int(0.10 * peak),
+        )
+
+        valid_mask = counts >= threshold
+        valid_mask = self.fill_small_gaps(valid_mask, max_gap=1)
+
+        valid = np.where(valid_mask)[0]
+        ranges = self.contiguous_ranges(valid)
+
+        if len(ranges) == 0:
+            return 0, seg.shape[0]
+
+        best_start, best_end = max(ranges, key=lambda r: r[1] - r[0] + 1)
+        return best_start, best_end + 1
+
+    def sample_dense_indices(self, rng, n_scans, valid_start, valid_end):
+        valid_start = max(0, int(valid_start))
+        valid_end = min(n_scans, int(valid_end))
+
+        if valid_end - valid_start < self.dense_size:
+            valid_start = 0
+            valid_end = n_scans
+
+        start_min = valid_start
+        start_max = valid_end - self.dense_size
+
+        if start_max < start_min:
+            start_min = 0
+            start_max = n_scans - self.dense_size
+
+        start = rng.integers(start_min, start_max + 1)
+        return list(range(start, start + self.dense_size))
+
+    def sample_one_batch(self, rng, dense_indices):
+        max_size = min(self.max_batch_size, len(dense_indices))
+        min_size = min(self.min_batch_size, max_size)
+
+        batch_size = rng.integers(min_size, max_size + 1)
+        start = rng.integers(0, len(dense_indices) - batch_size + 1)
+
+        return dense_indices[start:start + batch_size]
+
+    def sample_batches(self, rng, dense_indices):
+        num_batches = rng.integers(self.min_num_batches, self.max_num_batches + 1)
+        return [self.sample_one_batch(rng, dense_indices) for _ in range(num_batches)]
+
+    def sample_crop_cols(self, rng, W):
+        center = rng.integers(self.crop_l // 2, W - self.crop_l // 2 + 1)
+        return center - self.crop_l // 2, center + self.crop_l // 2
+
+    def make_complete_graph(self, num_nodes):
+        adj_mat = torch.ones(num_nodes, num_nodes)
+        edge_index, _ = pyg.utils.dense_to_sparse(adj_mat)
+        return edge_index
+
+    def crop_to_patch_tensor(self, img_crop):
+        img_crop = self.norm_img(img_crop)
+        tensor = torch.from_numpy(img_crop).float()[None, :, :]
+        tensor = tensor.repeat(3, 1, 1)
         return tensor
 
     def get(self, idx):
-        if self.dataset is not None:
-            img = self.dataset_get_fn(self.dataset[idx])
+        rng = np.random.default_rng(self.seed + idx)
 
-        rdim = torch.randint(len(self.patch_per_dim), size=(1,)).item()
-        patch_per_dim = self.patch_per_dim[rdim]
+        stack = self.tiff.imread(self.bscan_paths[idx])
+        seg = self.tiff.imread(self.seg_paths[idx])
 
-        height = patch_per_dim[0] * self.patch_size
-        width = patch_per_dim[1] * self.patch_size
+        print("raw stack:", stack.shape)
 
-        img = img.resize((width, height))#, resample=Resampling.BICUBIC)
+        stack = self.rotate_volume(stack)
+        seg = self.rotate_volume(seg)
 
-        img = self.transforms(img)
-        xy, patches = divide_images_into_patches(img, patch_per_dim, self.patch_size)
+        stack, seg = self.global_anatomy_crop(stack, seg)
 
-        xy = einops.rearrange(xy, "x y c -> (x y) c")
-        patches = einops.rearrange(patches, "x y c k1 k2 -> (x y) c k1 k2")
-        if self.padding > 0:
-            patches = self.zero_margin(patches)
-        indexes = torch.arange(patch_per_dim[0] * patch_per_dim[1]).reshape(
-            xy.shape[:-1]
+        print("after global crop stack:", stack.shape)
+
+        valid_start, valid_end = self.best_valid_scan_range(seg)
+
+        dense_indices = self.sample_dense_indices(rng, stack.shape[0], valid_start, valid_end)
+
+        full_shape = stack[0].shape
+        full_width = self.full_display_width(full_shape)
+
+        center = (len(dense_indices) - 1) / 2
+        ys = (center - np.arange(len(dense_indices))) * self.scan_spacing
+        idx_to_y = dict(zip(dense_indices, ys))
+
+        x_pad = 0.05 * full_width
+        xlim = [-full_width / 2 - x_pad, full_width / 2 + x_pad]
+
+        y_pad = self.scan_spacing * 2
+        ylim = [float(ys.min() - y_pad), float(ys.max() + y_pad)]
+
+        crop_display_width = (
+            self.col_to_full_x(self.crop_l, full_shape)
+            - self.col_to_full_x(0, full_shape)
         )
-        if self.degree == -1:
-            adj_mat = torch.ones(
-                patch_per_dim[0] * patch_per_dim[1], patch_per_dim[0] * patch_per_dim[1]
+
+        dense_imgs = []
+        dense_scan_indices = []
+
+        for scan_idx in dense_indices:
+            dense_imgs.append(self.crop_to_patch_tensor(stack[scan_idx]))
+            dense_scan_indices.append(scan_idx)
+
+        dense_imgs = torch.stack(dense_imgs)
+        dense_scan_indices = torch.tensor(dense_scan_indices).long()
+        dense_y = torch.tensor(ys, dtype=torch.float32)
+
+        node_patches = []
+        node_raw_xy = []
+        node_scan_indices = []
+        node_batch_ids = []
+        node_crop_windows = []
+
+        batches = self.sample_batches(rng, dense_indices)
+
+        valid_batch_id = 0
+
+        for batch_indices in batches:
+            c0, c1 = self.sample_crop_cols(rng, stack.shape[2])
+
+            current_patches = []
+            current_xy = []
+            current_scan_indices = []
+
+            for scan_idx in batch_indices:
+                y_scan = idx_to_y[scan_idx]
+
+                img_crop = stack[scan_idx, :, c0:c1]
+                seg_crop = seg[scan_idx, :, c0:c1]
+
+                center_px = self.anatomy_center_pixels(img_crop, seg_crop)
+
+                if center_px is None:
+                    continue
+
+                row, local_col = center_px
+                full_col = c0 + local_col
+
+                gx, gy = self.pixel_to_display_xy(row, full_col, y_scan, full_shape)
+
+                current_patches.append(self.crop_to_patch_tensor(img_crop))
+                current_xy.append([gx, gy])
+                current_scan_indices.append(scan_idx)
+
+            if len(current_patches) != len(batch_indices):
+                continue
+
+            for patch, xy, scan_idx in zip(current_patches, current_xy, current_scan_indices):
+                node_patches.append(patch)
+                node_raw_xy.append(xy)
+                node_scan_indices.append(scan_idx)
+                node_batch_ids.append(valid_batch_id)
+                node_crop_windows.append([c0, c1])
+
+            valid_batch_id += 1
+
+        if valid_batch_id < self.min_num_batches:
+            raise RuntimeError(
+                "OCT sample produced fewer than {} valid batches at index {}".format(
+                    self.min_num_batches, idx
+                )
             )
 
-            edge_index, _ = pyg.utils.dense_to_sparse(adj_mat)
-        else:
-            if not self.unique_graph:
-                edge_index = generate_random_expander(
-                    patch_per_dim[0] * patch_per_dim[1], self.degree
-                ).T
-        data = pyg_data.Data(
-            x=xy,
-            indexes=indexes,
-            patches=patches,
-            edge_index=self.edge_index[patch_per_dim]
-            if self.unique_graph
-            else edge_index,
-            ind_name=torch.tensor([idx]).long(),
-            patches_dim=torch.tensor([patch_per_dim]),
-        )
-        return data
+        if len(node_patches) < 2:
+            raise RuntimeError(
+                "OCT sample produced fewer than 2 valid scan nodes at index {}".format(idx)
+            )
 
+        patches = torch.stack(node_patches)
+        raw_xy = torch.tensor(node_raw_xy, dtype=torch.float32)
 
-class Puzzle_Dataset_ROT_MP(Puzzle_Dataset):
-    def __init__(
-        self,
-        dataset=None,
-        dataset_get_fn=None,
-        patch_per_dim=[(7, 6)],
-        patch_size=32,
-        augment=False,
-        concat_rot=True,
-        missing_perc=10,
-    ) -> None:
-        super().__init__(
-            dataset=dataset,
-            dataset_get_fn=dataset_get_fn,
-            patch_per_dim=patch_per_dim,
-            patch_size=patch_size,
-            augment=augment,
-        )
-        self.concat_rot = concat_rot
-        self.missing_pieces_perc = missing_perc
+        num_nodes = raw_xy.shape[0]
+        edge_index = self.make_complete_graph(num_nodes)
 
-    def get(self, idx):
-        if self.dataset is not None:
-            img = self.dataset_get_fn(self.dataset[idx])
+        anchor_idx = int(rng.integers(0, num_nodes))
+        anchor_xy = raw_xy[anchor_idx].clone()
 
-        rdim = torch.randint(len(self.patch_per_dim), size=(1,)).item()
-        patch_per_dim = self.patch_per_dim[rdim]
+        gt_delta = raw_xy - anchor_xy
+        gt_delta[anchor_idx] = 0.0
 
-        height = patch_per_dim[0] * self.patch_size
-        width = patch_per_dim[1] * self.patch_size
-
-        img = img.resize((width, height))#, resample=Resampling.BICUBIC)
-
-        img = self.transforms(img)
-        xy, patches = divide_images_into_patches(img, patch_per_dim, self.patch_size)
-
-        xy = einops.rearrange(xy, "x y c -> (x y) c")
-        patches = einops.rearrange(patches, "x y c k1 k2 -> (x y) c k1 k2")
-
-        patches_num = patches.shape[0]
-
-        patches_numpy = (
-            (patches * 255).long().numpy().transpose(0, 2, 3, 1).astype(np.uint8)
-        )
-        patches_im = [Image.fromarray(patches_numpy[x]) for x in range(patches_num)]
-        random_rot = torch.randint(low=0, high=4, size=(patches_num,))
-        random_rot_one_hot = torch.nn.functional.one_hot(random_rot, 4)
-
-        # rotation classes : 0 -> no rotation
-        #                   1 -> 90 degrees
-        #                   2 -> 180 degrees
-        #                   3 -> 270 degrees
-
-        indexes = torch.arange(patch_per_dim[0] * patch_per_dim[1]).reshape(
-            xy.shape[:-1]
-        )
-
-        rots = torch.tensor(
-            [
-                [1, 0],
-                [0, 1],
-                [-1, 0],
-                [0, -1],
-            ]
-        )
-
-        rots_tensor = random_rot_one_hot @ rots
-        rotated_patch = [
-            x.rotate(rot * 90) for (x, rot) in zip(patches_im, random_rot)
-        ]  # in PIL
-
-        rotated_patch_tensor = [
-            torch.tensor(np.array(patch)).permute(2, 0, 1).float() / 255
-            for patch in rotated_patch
-        ]
-
-        patches = torch.stack(rotated_patch_tensor)
-        if self.concat_rot:
-            xy = torch.cat([xy, rots_tensor], 1)
-
-        num_pieces = xy.shape[0]
-        pieces_to_remove = math.ceil(num_pieces * self.missing_pieces_perc / 100)
-
-        perm = list(range(num_pieces))
-
-        random.shuffle(perm)
-        perm = perm[: num_pieces - pieces_to_remove]
-        xy = xy[perm]
-        patches = patches[perm]
-
-        adj_mat = torch.ones(xy.shape[0], xy.shape[0])
-        edge_index, edge_attr = pyg.utils.dense_to_sparse(adj_mat)
+        is_anchor = torch.zeros(num_nodes, 1, dtype=torch.float32)
+        is_anchor[anchor_idx, 0] = 1.0
 
         data = pyg_data.Data(
-            x=xy,
-            indexes=indexes,
-            rot=rots_tensor,
-            rot_index=random_rot,
+            x=gt_delta,
             patches=patches,
             edge_index=edge_index,
             ind_name=torch.tensor([idx]).long(),
-            patches_dim=torch.tensor([patch_per_dim]),
+            patches_dim=torch.tensor([[num_nodes, 1]]),
+
+            scan_indices=torch.tensor(node_scan_indices).long(),
+            batch_ids=torch.tensor(node_batch_ids).long(),
+            crop_windows=torch.tensor(node_crop_windows).long(),
+
+            raw_xy=raw_xy,
+
+            gt_delta=gt_delta,
+            anchor_idx=torch.tensor([anchor_idx]).long(),
+            anchor_xy=anchor_xy[None, :],
+            is_anchor=is_anchor,
+
+            dense_imgs=dense_imgs.unsqueeze(0),
+            dense_scan_indices=dense_scan_indices.unsqueeze(0),
+            dense_y=dense_y.unsqueeze(0),
+
+            xlim=torch.tensor(xlim, dtype=torch.float32),
+            ylim=torch.tensor(ylim, dtype=torch.float32),
+            full_width=torch.tensor([full_width], dtype=torch.float32),
+            crop_display_width=torch.tensor([crop_display_width], dtype=torch.float32),
+            display_height=torch.tensor([self.display_height], dtype=torch.float32),
         )
+
         return data
-
-
-class Puzzle_Dataset_MP(Puzzle_Dataset):
-    def __init__(
-        self,
-        dataset=None,
-        dataset_get_fn=None,
-        patch_per_dim=[(7, 6)],
-        patch_size=32,
-        missing_perc=10,
-        augment=False,
-    ) -> None:
-        super().__init__(
-            dataset=dataset,
-            dataset_get_fn=dataset_get_fn,
-            patch_per_dim=patch_per_dim,
-            patch_size=patch_size,
-            augment=augment,
-        )
-        self.missing_pieces_perc = missing_perc
-
-    def get(self, idx):
-        if self.dataset is not None:
-            img = self.dataset_get_fn(self.dataset[idx])
-
-        rdim = torch.randint(len(self.patch_per_dim), size=(1,)).item()
-        patch_per_dim = self.patch_per_dim[rdim]
-
-        height = patch_per_dim[0] * self.patch_size
-        width = patch_per_dim[1] * self.patch_size
-
-        img = img.resize((width, height))#, resample=Resampling.BICUBIC)
-
-        img = self.transforms(img)
-        xy, patches = divide_images_into_patches(img, patch_per_dim, self.patch_size)
-
-        xy = einops.rearrange(xy, "x y c -> (x y) c")
-        patches = einops.rearrange(patches, "x y c k1 k2 -> (x y) c k1 k2")
-
-        num_pieces = xy.shape[0]
-        pieces_to_remove = math.ceil(num_pieces * self.missing_pieces_perc / 100)
-
-        perm = list(range(num_pieces))
-
-        random.shuffle(perm)
-        perm = perm[: num_pieces - pieces_to_remove]
-        xy = xy[perm]
-        patches = patches[perm]
-
-        adj_mat = torch.ones(xy.shape[0], xy.shape[0])
-        edge_index, edge_attr = pyg.utils.dense_to_sparse(adj_mat)
-        data = pyg_data.Data(
-            x=xy,
-            patches=patches,
-            edge_index=edge_index,
-            ind_name=torch.tensor([idx]).long(),
-            patches_dim=torch.tensor([patch_per_dim]),
-        )
-        return data
-
-
-class Puzzle_Dataset_ROT(Puzzle_Dataset):
-    def __init__(
-        self,
-        dataset=None,
-        dataset_get_fn=None,
-        patch_per_dim=[(7, 6)],
-        patch_size=32,
-        augment=False,
-        concat_rot=True,
-        degree=-1,
-        unique_graph=None,
-        all_equivariant=False,
-        random_dropout=False,
-    ) -> None:
-        super().__init__(
-            dataset=dataset,
-            dataset_get_fn=dataset_get_fn,
-            patch_per_dim=patch_per_dim,
-            patch_size=patch_size,
-            augment=augment,
-            degree=degree,
-            unique_graph=unique_graph,
-        )
-        self.concat_rot = concat_rot
-        self.degree = degree
-        self.all_equivariant = all_equivariant
-        self.unique_graph = unique_graph
-        self.random_dropout = random_dropout
-        if self.unique_graph is not None:
-            self.edge_index = create_graph(
-                self.patch_per_dim, self.degree, self.unique_graph
-            )
-
-    def get(self, idx):
-        if self.dataset is not None:
-            img = self.dataset_get_fn(self.dataset[idx])
-
-        rdim = torch.randint(len(self.patch_per_dim), size=(1,)).item()
-        patch_per_dim = self.patch_per_dim[rdim]
-
-        height = patch_per_dim[0] * self.patch_size
-        width = patch_per_dim[1] * self.patch_size
-
-        img = img.resize((width, height), resample=Resampling.LANCZOS)#, resample=Resampling.BICUBIC)
-
-        img = self.transforms(img)
-        xy, patches = divide_images_into_patches(img, patch_per_dim, self.patch_size)
-
-        xy = einops.rearrange(xy, "x y c -> (x y) c")
-        patches = einops.rearrange(patches, "x y c k1 k2 -> (x y) c k1 k2")
-
-        patches_num = patches.shape[0]
-
-        patches_numpy = (
-            (patches * 255).long().numpy().transpose(0, 2, 3, 1).astype(np.uint8)
-        )
-        patches_im = [Image.fromarray(patches_numpy[x]) for x in range(patches_num)]
-        random_rot = torch.randint(low=0, high=4, size=(patches_num,))
-        random_rot_one_hot = torch.nn.functional.one_hot(random_rot, 4)
-
-        # if self.degree == '100%':
-
-        if self.degree == -1 or self.degree == "100%":
-            adj_mat = torch.ones(
-                patch_per_dim[0] * patch_per_dim[1], patch_per_dim[0] * patch_per_dim[1]
-            )
-
-            edge_index, _ = pyg.utils.dense_to_sparse(adj_mat)
-        elif self.random_dropout:
-            adj_mat = torch.ones(
-                patch_per_dim[0] * patch_per_dim[1], patch_per_dim[0] * patch_per_dim[1]
-            )
-
-            edge_index, _ = pyg.utils.dense_to_sparse(adj_mat)
-            degree = round(
-                (int(self.degree[:-1]) * (int(patch_per_dim[0] * patch_per_dim[1]) - 1))
-                / 100
-            )
-            n_connections = int(patch_per_dim[0] * patch_per_dim[1] * degree)
-            edge_index = edge_index[:, torch.randperm(edge_index.shape[1])][
-                :, :n_connections
-            ]
-
-        else:
-            if not self.unique_graph:
-                edge_index = generate_random_expander(
-                    patch_per_dim[0] * patch_per_dim[1], self.degree
-                ).T
-
-        # rotation classes : 0 -> no rotation
-        #                   1 -> 90 degrees
-        #                   2 -> 180 degrees
-        #                   3 -> 270 degrees
-
-        indexes = torch.arange(patch_per_dim[0] * patch_per_dim[1]).reshape(
-            xy.shape[:-1]
-        )
-
-        rots = torch.tensor(
-            [
-                [1, 0],
-                [0, 1],
-                [-1, 0],
-                [0, -1],
-            ]
-        )
-
-        rots_tensor = random_rot_one_hot @ rots
-
-        # ruoto l'immagine casualmente
-
-        rotated_patch = [
-            x.rotate(rot * 90) for (x, rot) in zip(patches_im, random_rot)
-        ]  # in PIL
-
-        if self.all_equivariant:
-            rotated_patch_1 = [
-                [x.rotate(rot * 90) for rot in range(4)] for x in rotated_patch
-            ]  # type: ignore
-
-            rotated_patch_tensor = [
-                [
-                    torch.tensor(np.array(patch)).permute(2, 0, 1).float() / 255
-                    for patch in test
-                ]
-                for test in rotated_patch_1
-            ]
-        else:
-            rotated_patch_tensor = [
-                torch.tensor(np.array(patch)).permute(2, 0, 1).float() / 255
-                for patch in rotated_patch
-            ]
-
-        patches = (
-            torch.stack([torch.stack(i) for i in rotated_patch_tensor])
-            if self.all_equivariant
-            else torch.stack(rotated_patch_tensor)
-        )
-        if self.concat_rot:
-            xy = torch.cat([xy, rots_tensor], 1)
-
-        data = pyg_data.Data(
-            x=xy,
-            indexes=indexes,
-            rot=rots_tensor,
-            rot_index=random_rot,
-            patches=patches,
-            edge_index=self.edge_index[patch_per_dim]
-            if self.unique_graph
-            else edge_index,
-            ind_name=torch.tensor([idx]).long(),
-            patches_dim=torch.tensor([patch_per_dim]),
-        )
-        return data
-
-
+    
+    
 if __name__ == "__main__":
-    from celeba_dt import CelebA_HQ
+    from pathlib import Path
+    import torch_geometric
 
-    train_dt = CelebA_HQ(train=True)
-    dt = Puzzle_Dataset_ROT(
-        train_dt, dataset_get_fn=lambda x: x[0], patch_per_dim=[(4, 4)]
+    bscan_paths = sorted(Path("/home/jeanine/DiffAssemble/datasets/rl-whole-eye/processed_data").glob("batch_*/*/*_bscans.tif"))
+    seg_paths = sorted(Path("/home/jeanine/DiffAssemble/datasets/rl-whole-eye/processed_data").glob("batch_*/*/*_depth_segmentation.tif"))
+
+    dt = OCTPuzzleDataset(
+        bscan_paths=bscan_paths[:10],
+        seg_paths=seg_paths[:10],
+        seed=0,
     )
 
-    dl = torch_geometric.loader.DataLoader(dt, batch_size=100)
-    dl_iter = iter(dl)
-
-    for i in range(5):
-        k = next(dl_iter)
-    pass
+    sample = dt[0]
+    print(sample)
+    print(sample.x.shape)
+    print(sample.patches.shape)
+    print(sample.edge_index.shape)
+    print(sample.raw_xy)

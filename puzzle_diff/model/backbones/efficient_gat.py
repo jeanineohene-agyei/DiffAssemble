@@ -5,8 +5,6 @@ from torch import Tensor
 from torch_geometric.nn import GraphNorm
 from torch.nn import functional as F
 
-from .resnet_equivariant import ResNet18, ResNet34, ResNet50
-from .gcn import GCN
 from .exophormer_gnn import Exophormer_GNN
 from .Transformer_GNN import Transformer_GNN
 from torchvision.transforms.functional import rotate
@@ -34,10 +32,7 @@ class Eff_GAT(nn.Module):
         all_equivariant=False
     ) -> None:
         super().__init__()
-        if model == "resnet18equiv":
-            self.visual_backbone = ResNet18()
-        else:
-            self.visual_backbone = timm.create_model(
+        self.visual_backbone = timm.create_model(
                 model, pretrained=visual_pretrained, features_only=True
             )
         self.all_equivariant=all_equivariant
@@ -45,8 +40,7 @@ class Eff_GAT(nn.Module):
         self.combined_features_dim = {
             "resnet18": 3136,
             "resnet50": 12352,
-            "efficientnet_b0": 1088 + 32 + 32,
-            'resnet18equiv': 1088 + 32 + 32, #3136,
+            "efficientnet_b0": 1216 + 32 + 32 + 16,
             #97792 + 32 + 32 resnet50
         }[model]
 
@@ -60,12 +54,6 @@ class Eff_GAT(nn.Module):
                 n_layers=n_layers,
                 hidden_dim=32 * 8,
                 heads=8,
-                output_size=self.combined_features_dim,
-            )
-        elif architecture == "gcn":
-            self.gnn_backbone = GCN(
-                self.combined_features_dim,
-                hidden_dim=32 * 8,
                 output_size=self.combined_features_dim,
             )
         elif architecture == "exophormer":
@@ -83,7 +71,12 @@ class Eff_GAT(nn.Module):
         self.pos_mlp = nn.Sequential(
             nn.Linear(input_channels, 16), nn.GELU(), nn.Linear(16, 32)
         )
-        # self.GN = GraphNorm(self.combined_features_dim)
+        
+        self.anchor_mlp = nn.Sequential(
+            nn.Linear(1, 8),
+            nn.GELU(),
+            nn.Linear(8, 16),
+        )
 
         self.final_mlp = nn.Sequential(
             nn.Linear(self.combined_features_dim, 32),
@@ -94,7 +87,7 @@ class Eff_GAT(nn.Module):
         self.pos_mlp = nn.Sequential(
             nn.Linear(input_channels, 16), nn.GELU(), nn.Linear(16, 32)
         )
-        # self.GN = GraphNorm(self.combined_features_dim)
+        
         self.mlp = nn.Sequential(
             nn.Linear(self.combined_features_dim, 128),
             nn.GELU(),
@@ -111,10 +104,10 @@ class Eff_GAT(nn.Module):
         self.register_buffer("mean", mean)
         self.register_buffer("std", std)
 
-    def forward(self, xy_pos, time, patch_rgb, edge_index, batch):
+    def forward(self, xy_pos, time, patch_rgb, edge_index, batch, is_anchor):
         patch_feats = self.visual_features(patch_rgb)
         final_feats = self.forward_with_feats(
-            xy_pos, time, patch_rgb, edge_index, patch_feats=patch_feats, batch=batch
+            xy_pos, time, edge_index, patch_feats=patch_feats, batch=batch, is_anchor=is_anchor,
         )
         return final_feats
 
@@ -122,16 +115,17 @@ class Eff_GAT(nn.Module):
         self: nn.Module,
         xy_pos: Tensor,
         time: Tensor,
-        patch_rgb: Tensor,
         edge_index: Tensor,
         patch_feats: Tensor,
         batch,
+        is_anchor,
     ):
 
         time_feats = self.time_emb(time)  # embedding, int -> 32
         pos_feats = self.pos_mlp(xy_pos)  # MLP, (x, y) -> 32
+        anchor_feats = self.anchor_mlp(is_anchor.float())
         # COMBINE  and transform with MLP
-        combined_feats = torch.cat([patch_feats, pos_feats, time_feats], -1)
+        combined_feats = torch.cat([patch_feats, pos_feats, time_feats, anchor_feats], -1)
         combined_feats = self.mlp(combined_feats)
 
         # GNN
@@ -160,9 +154,13 @@ class Eff_GAT(nn.Module):
             else:
                 feats = self.visual_backbone.forward(patch_rgb)
         feats = {
+            # "efficientnet_b0": [
+            #     feats[2].reshape(patch_rgb.shape[0], -1),
+            #     feats[3].reshape(patch_rgb.shape[0], -1),
+            # ],
             "efficientnet_b0": [
-                feats[2].reshape(patch_rgb.shape[0], -1),
-                feats[3].reshape(patch_rgb.shape[0], -1),
+                F.adaptive_avg_pool2d(feats[2], (4, 2)).flatten(1),
+                F.adaptive_avg_pool2d(feats[3], (4, 2)).flatten(1)
             ],
             "resnet50": [
                 feats[2].reshape(patch_rgb.shape[0], -1),
@@ -187,4 +185,3 @@ class Eff_GAT(nn.Module):
         #else:
         patch_feats = torch.cat(feats, -1)
         return patch_feats
-
