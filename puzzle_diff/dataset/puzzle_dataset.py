@@ -13,6 +13,8 @@ from torch import Tensor
 from torch_geometric.utils import get_laplacian, to_scipy_sparse_matrix
 from torchvision.transforms import InterpolationMode
 from torchvision.transforms import functional as F
+from pathlib import Path
+import tifffile as tiff
 
 # import albumentations
 # import cv2
@@ -312,9 +314,6 @@ class OCTPuzzleDataset(pyg_data.Dataset):
         seed=42,
     ):
         super().__init__()
-        import tifffile as tiff
-
-        self.tiff = tiff
         self.bscan_paths = list(bscan_paths)
         self.seg_paths = list(seg_paths)
         assert len(self.bscan_paths) == len(self.seg_paths)
@@ -332,6 +331,12 @@ class OCTPuzzleDataset(pyg_data.Dataset):
         self.margin_x_left = margin_x_left
         self.margin_x_right = margin_x_right
         self.min_mask_pixels = min_mask_pixels
+        
+        self.rotation_overrides = {
+            "a947ccaffbe1": 1,
+        }
+
+        self.default_rotation = 3
 
         self.display_height = display_height
         self.scan_spacing = scan_spacing
@@ -350,8 +355,18 @@ class OCTPuzzleDataset(pyg_data.Dataset):
         lo, hi = np.percentile(img, [1, 99])
         return np.clip((img - lo) / (hi - lo + 1e-8), 0, 1)
 
-    def rotate_volume(self, vol):
-        return np.rot90(vol, k=3, axes=(1, 2)).copy()
+    # def rotate_volume(self, vol):
+    #     return np.rot90(vol, k=3, axes=(1, 2)).copy()
+    
+    def rotate_volume(self, vol, bscan_path):
+        participant = Path(bscan_path).parent.name
+
+        k = self.rotation_overrides.get(
+            participant,
+            self.default_rotation,
+        )
+
+        return np.rot90(vol, k=k, axes=(1, 2)).copy()
 
     def global_anatomy_crop(self, stack, seg):
         mask = seg > 0
@@ -505,17 +520,13 @@ class OCTPuzzleDataset(pyg_data.Dataset):
     def get(self, idx):
         rng = np.random.default_rng(self.seed + idx)
 
-        stack = self.tiff.imread(self.bscan_paths[idx])
-        seg = self.tiff.imread(self.seg_paths[idx])
+        stack = tiff.imread(self.bscan_paths[idx])
+        seg = tiff.imread(self.seg_paths[idx])
 
-        print("raw stack:", stack.shape)
+        stack = self.rotate_volume(stack, self.bscan_paths[idx])
+        seg = self.rotate_volume(seg, self.bscan_paths[idx])
 
-        stack = self.rotate_volume(stack)
-        seg = self.rotate_volume(seg)
-
-        stack, seg = self.global_anatomy_crop(stack, seg)
-
-        print("after global crop stack:", stack.shape)
+        # stack, seg = self.global_anatomy_crop(stack, seg)
 
         valid_start, valid_end = self.best_valid_scan_range(seg)
 
@@ -656,24 +667,4 @@ class OCTPuzzleDataset(pyg_data.Dataset):
         )
 
         return data
-    
-    
-if __name__ == "__main__":
-    from pathlib import Path
-    import torch_geometric
 
-    bscan_paths = sorted(Path("/home/jeanine/DiffAssemble/datasets/rl-whole-eye/processed_data").glob("batch_*/*/*_bscans.tif"))
-    seg_paths = sorted(Path("/home/jeanine/DiffAssemble/datasets/rl-whole-eye/processed_data").glob("batch_*/*/*_depth_segmentation.tif"))
-
-    dt = OCTPuzzleDataset(
-        bscan_paths=bscan_paths[:10],
-        seg_paths=seg_paths[:10],
-        seed=0,
-    )
-
-    sample = dt[0]
-    print(sample)
-    print(sample.x.shape)
-    print(sample.patches.shape)
-    print(sample.edge_index.shape)
-    print(sample.raw_xy)

@@ -21,6 +21,8 @@ def get_dataset(cfg):
     if n is not None:
         bscan_paths = bscan_paths[:n]
         seg_paths = seg_paths[:n]
+        
+    print("Found {} volumes under {}".format(len(bscan_paths), root))
 
     split = max(1, int(0.9 * len(bscan_paths)))
 

@@ -1,16 +1,15 @@
-experiment_name: oct_overfit_unfreeze_backbone_spatial_map
+experiment_name: test_paths
 
-batch_size: 1
-gpus: 1
-steps: 1
+batch_size: 4
+gpus: 2
+steps: 50
 num_workers: 4
 max_epochs: 1000
 
 learning_rate: 1e-4
 
 dataset: oct
-oct_root: /home/jeanine/DiffAssemble/datasets/rl-whole-eye/processed_data
-train_num_volumes: 1
+oct_root: /data/jeanine/processed_data
 
 sampling: DDIM
 inference_ratio: 1
