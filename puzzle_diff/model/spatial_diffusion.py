@@ -133,6 +133,8 @@ class GNN_Diffusion(pl.LightningModule):
         steps=600,
         inference_ratio=1,
         sampling="DDPM",
+        include_dense_vis=False,
+        dense_vis_epochs=0,
         learning_rate=1e-4,
         save_and_sample_every=1000,
         bb=None,
@@ -158,6 +160,9 @@ class GNN_Diffusion(pl.LightningModule):
 
         self.visual_pretrained = visual_pretrained
         self.free_backbone = freeze_backbone
+        
+        self.include_dense_vis = include_dense_vis
+        self.dense_vis_epochs = dense_vis_epochs
 
         self.model_mean_type = model_mean_type
         self.learning_rate = learning_rate
@@ -897,13 +902,8 @@ class GNN_Diffusion(pl.LightningModule):
                 self.metrics["val_rmse"].update(rmse)
                 self.metrics["val_mae"].update(mae)
                 self.metrics["val_mean_dist"].update(mean_dist)
-                self.metrics["overall_acc"].update(-mean_dist)
 
-                if (
-                    self.local_rank == 0
-                    and batch_idx < 10
-                    and i < min(batch.batch.max().item() + 1, 4)
-                ):
+                if self.local_rank == 0 and batch_idx == 0 and i < 4:
                     save_path = Path(f"results/{self.logger.experiment.name}/val")
 
                     self.save_oct_image(
@@ -1307,26 +1307,24 @@ class GNN_Diffusion(pl.LightningModule):
         crop_display_width = float(crop_display_width.detach().cpu().view(-1)[0])
         display_height = float(display_height.detach().cpu().view(-1)[0])
 
-        # Use only ground truth to define anchored plot limits.
-        # Random epoch-0 predictions should not resize all the plots.
-        # gt_x_min = float(gt_pos[:, 0].min())
-        # gt_x_max = float(gt_pos[:, 0].max())
-        # gt_y_min = float(gt_pos[:, 1].min())
-        # gt_y_max = float(gt_pos[:, 1].max())
+        show_dense = (
+            self.include_dense_vis
+            and self.current_epoch < self.dense_vis_epochs
+            and dense_imgs.numel() > 0
+        )
 
-        # anchored_x_pad = max(crop_display_width, 0.05)
-        # anchored_y_pad = max(display_height / 2, 0.20)
+        if show_dense:
+            fig, axes = plt.subplots(1, 4, figsize=(24, 12))
+            dense_ax = axes[0]
+            original_ax = axes[1]
+            gt_ax = axes[2]
+            pred_ax = axes[3]
+        else:
+            fig, axes = plt.subplots(1, 3, figsize=(18, 12))
+            original_ax = axes[0]
+            gt_ax = axes[1]
+            pred_ax = axes[2]
 
-        # anchored_xlim = [
-        #     gt_x_min - anchored_x_pad,
-        #     gt_x_max + anchored_x_pad,
-        # ]
-
-        # anchored_ylim = [
-        #     gt_y_min - anchored_y_pad,
-        #     gt_y_max + anchored_y_pad,
-        # ]
-        
         raw_x_span = raw_xlim[1] - raw_xlim[0]
         raw_y_span = raw_ylim[1] - raw_ylim[0]
 
@@ -1341,46 +1339,52 @@ class GNN_Diffusion(pl.LightningModule):
         anchored_x_center = (needed_x_min + needed_x_max) / 2
         anchored_y_center = (needed_y_min + needed_y_max) / 2
 
-        anchored_xlim = [anchored_x_center - anchored_x_span / 2, anchored_x_center + anchored_x_span / 2]
-        anchored_ylim = [anchored_y_center - anchored_y_span / 2, anchored_y_center + anchored_y_span / 2]
-        fig, axes = plt.subplots(1, 4, figsize=(24, 12))
+        anchored_xlim = [
+            anchored_x_center - anchored_x_span / 2,
+            anchored_x_center + anchored_x_span / 2,
+        ]
 
-        # panel 1 -> dense-volume projection in original pixel space
-        # no width_stretch, display_height, or recon XY
-        ax = axes[0]
+        anchored_ylim = [
+            anchored_y_center - anchored_y_span / 2,
+            anchored_y_center + anchored_y_span / 2,
+        ]
 
-        for j in range(dense_imgs.shape[0]):
-            y_center = float(dense_y[j])
+        # Dense-volume panel, only shown for the first dense_vis_epochs.
+        if show_dense:
+            ax = dense_ax
 
-            self.add_oct_patch(
-                ax=ax,
-                patch=dense_imgs[j],
-                x_center=0.0,
-                y_center=y_center,
-                display_height=display_height,
-                crop_width=full_width,
-                alpha_floor=0.10,
-                zorder=1,
-            )
+            for j in range(dense_imgs.shape[0]):
+                y_center = float(dense_y[j])
 
-            ax.text(
-                raw_xlim[0],
-                y_center,
-                str(int(dense_scan_indices[j])),
-                ha="right",
-                va="center",
-                fontsize=6,
-            )
+                self.add_oct_patch(
+                    ax=ax,
+                    patch=dense_imgs[j],
+                    x_center=0.0,
+                    y_center=y_center,
+                    display_height=display_height,
+                    crop_width=full_width,
+                    alpha_floor=0.10,
+                    zorder=1,
+                )
 
-        ax.set_xlim(raw_xlim)
-        ax.set_ylim(raw_ylim)
-        ax.grid(alpha=0.3)
-        ax.set_title("Dense volume")
-        ax.set_xlabel("Full scan width")
-        ax.set_ylabel("Scan position")
+                ax.text(
+                    raw_xlim[0],
+                    y_center,
+                    str(int(dense_scan_indices[j])),
+                    ha="right",
+                    va="center",
+                    fontsize=6,
+                )
 
-        # panel 2 -> crops in the original reconstruction coordinates
-        ax = axes[1]
+            ax.set_xlim(raw_xlim)
+            ax.set_ylim(raw_ylim)
+            ax.grid(alpha=0.3)
+            ax.set_title("Dense volume")
+            ax.set_xlabel("Full scan width")
+            ax.set_ylabel("Scan position")
+
+        # Original crop positions.
+        ax = original_ax
 
         for p in range(patches_rgb.shape[0]):
             self.add_oct_patch(
@@ -1421,8 +1425,8 @@ class GNN_Diffusion(pl.LightningModule):
         ax.set_xlabel("Original x")
         ax.set_ylabel("Original y")
 
-        # panel 3 -> anchor-relative ground truth
-        ax = axes[2]
+        # Anchor-relative ground truth.
+        ax = gt_ax
 
         for p in range(patches_rgb.shape[0]):
             self.add_oct_patch(
@@ -1458,7 +1462,6 @@ class GNN_Diffusion(pl.LightningModule):
 
         ax.axhline(0.0, color="black", linewidth=1.8, alpha=0.9, zorder=0)
         ax.axvline(0.0, color="black", linewidth=1.8, alpha=0.9, zorder=0)
-        ax.grid(alpha=0.15)
         ax.set_xlim(anchored_xlim)
         ax.set_ylim(anchored_ylim)
         ax.grid(alpha=0.3)
@@ -1466,8 +1469,8 @@ class GNN_Diffusion(pl.LightningModule):
         ax.set_xlabel("Anchor-relative x")
         ax.set_ylabel("Anchor-relative y")
 
-        # panel 4: current diffusion prediction
-        ax = axes[3]
+        # Current diffusion prediction.
+        ax = pred_ax
 
         for p in range(patches_rgb.shape[0]):
             self.add_oct_patch(
@@ -1503,9 +1506,6 @@ class GNN_Diffusion(pl.LightningModule):
 
         ax.axhline(0.0, color="black", linewidth=1.8, alpha=0.9, zorder=0)
         ax.axvline(0.0, color="black", linewidth=1.8, alpha=0.9, zorder=0)
-        ax.grid(alpha=0.15)
-
-        # Use the same limits as the ground-truth panel for direct comparison.
         ax.set_xlim(anchored_xlim)
         ax.set_ylim(anchored_ylim)
         ax.grid(alpha=0.3)
@@ -1549,12 +1549,11 @@ class GNN_Diffusion(pl.LightningModule):
             fig.canvas.tostring_rgb(),
         )
 
-        self.logger.experiment.log(
-            {
-                f"{file_name.stem}_oct": wandb.Image(im),
-                "global_step": self.global_step,
-            }
-        )
+        self.logger.experiment.log({
+            f"{file_name.stem}_oct": wandb.Image(im),
+            "global_step": self.global_step,
+        })
 
-        plt.savefig(out_path, dpi=300)
+        plt.savefig(out_path, dpi=150)
         plt.close(fig)
+        

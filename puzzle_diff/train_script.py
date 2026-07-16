@@ -52,6 +52,8 @@ def main(**cfg):
     model = sd.GNN_Diffusion(
         steps=cfg["steps"],
         sampling=cfg["sampling"],
+        include_dense_vis=cfg.get("include_dense_vis", False),
+        dense_vis_epochs=cfg.get("dense_vis_epochs", 0),
         learning_rate=float(cfg["learning_rate"]),
         inference_ratio=cfg["inference_ratio"],
         classifier_free_w=cfg["classifier_free_w"],
