@@ -92,6 +92,7 @@ def main(**cfg):
     trainer = pl.Trainer(
         accelerator="gpu",
         devices=cfg["gpus"],
+        strategy="ddp" if cfg["gpus"] > 1 else None,
         accumulate_grad_batches=cfg["acc_grad"] if cfg["acc_grad"] > 0 else None,
         check_val_every_n_epoch=5,
         logger=wandb_logger,

@@ -1,10 +1,10 @@
-experiment_name: test_paths
+experiment_name: oct_360_baseline_frozen
 
 batch_size: 4
-gpus: 2
+gpus: 1
 steps: 50
 num_workers: 4
-max_epochs: 1000
+max_epochs: 300
 
 learning_rate: 1e-4
 
@@ -27,7 +27,7 @@ predict_xstart: true
 rotation: false
 only_rotation: false
 
-freeze_backbone: false
+freeze_backbone: true
 visual_pretrained: true
 discrete: false
 backbone: efficientnet_b0
@@ -43,6 +43,6 @@ save_eval_images: false
 dense_size: 30
 crop_l: 120
 min_num_batches: 4
-max_num_batches: 4
+max_num_batches: 6
 min_batch_size: 3
-max_batch_size: 3
+max_batch_size: 8

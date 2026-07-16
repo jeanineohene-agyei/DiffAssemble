@@ -36,7 +36,7 @@ def get_dataset(cfg):
         min_batch_size=cfg["min_batch_size"],
         max_batch_size=cfg["max_batch_size"],
         degree=cfg["degree"],
-        seed=None,
+        seed=42,
     )
 
     test_dt = OCTPuzzleDataset(

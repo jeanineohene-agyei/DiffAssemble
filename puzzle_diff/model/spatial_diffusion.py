@@ -279,13 +279,12 @@ class GNN_Diffusion(pl.LightningModule):
     #     metrics["overall_nImages"] = torchmetrics.SumMetric()
     #     self.metrics = nn.ModuleDict(metrics)
     
-    def initialize_torchmetrics(self, n_patches):
+    def initialize_torchmetrics(self, n_patches=None):
         self.metrics = nn.ModuleDict({
             "val_mse": torchmetrics.MeanMetric(),
             "val_rmse": torchmetrics.MeanMetric(),
             "val_mae": torchmetrics.MeanMetric(),
             "val_mean_dist": torchmetrics.MeanMetric(),
-            "overall_acc": torchmetrics.MeanMetric(),  # keep only because checkpoint monitors this
         })
 
     def forward(self, xy_pos, time, patch_rgb, edge_index, batch, is_anchor=None) -> Any:
@@ -714,7 +713,7 @@ class GNN_Diffusion(pl.LightningModule):
                         # xlim=batch.xlim[i],
                         # ylim=batch.ylim[i],
                         xlim=batch.xlim.view(-1, 2)[i],
-    ylim=batch.ylim.view(-1, 2)[i],
+                        ylim=batch.ylim.view(-1, 2)[i],
                         full_width=batch.full_width[i],
                         crop_display_width=batch.crop_display_width[i],
                         display_height=batch.display_height[i],
