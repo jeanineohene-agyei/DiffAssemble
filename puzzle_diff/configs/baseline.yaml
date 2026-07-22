@@ -1,26 +1,37 @@
-experiment_name: oct_360_baseline_frozen
+experiment_name: 8_test_coord_updates
 
-batch_size: 4
-gpus: 1
-steps: 50
-num_workers: 4
-max_epochs: 300
+batch_size: 1
+acc_grad: 4
+gpus: 2
+steps: 1000
+num_workers: 8
 
-learning_rate: 1e-4
+max_epochs: 10000
+max_steps: 200000
+
+val_check_interval: 500
 
 include_dense_vis: true
-dense_vis_epochs: 2
+dense_vis_epochs: 1
 
 dataset: oct
 oct_root: /data/jeanine/processed_data
 
-sampling: DDIM
-inference_ratio: 1
+# train_num_volumes: 1
+samples_per_volume: 5
+randomize_samples: true
+rough_condition_dropout: 0.25
 
-offline: true
+sampling: DDIM
+inference_ratio: 20
+
+offline: false
 wandb_id: null
 
-classifier_free_w: 0.2
+backbone_learning_rate: 1e-5
+head_learning_rate: 1e-4
+
+classifier_free_w: 0.0
 classifier_free_prob: 0.0
 data_augmentation: none
 checkpoint_path: ""
@@ -30,7 +41,7 @@ predict_xstart: true
 rotation: false
 only_rotation: false
 
-freeze_backbone: true
+freeze_backbone: false
 visual_pretrained: true
 discrete: false
 backbone: efficientnet_b0
@@ -40,12 +51,12 @@ all_equivariant: false
 degree: -1
 virt_nodes: 4
 inf_fully: false
-acc_grad: 0
-save_eval_images: false
+save_eval_images: true
 
-dense_size: 30
-crop_l: 120
-min_num_batches: 4
-max_num_batches: 6
+dense_size: 10
+crop_l: 200
+
+min_num_batches: 3
+max_num_batches: 5
 min_batch_size: 3
-max_batch_size: 8
+max_batch_size: 6
