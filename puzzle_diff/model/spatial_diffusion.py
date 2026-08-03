@@ -137,6 +137,8 @@ class GNN_Diffusion(pl.LightningModule):
         dense_vis_epochs=0,
         backbone_learning_rate=1e-5,
         head_learning_rate=1e-4,
+        backbone_weight_decay=0.0,
+        head_weight_decay=1e-4,
         save_and_sample_every=1000,
         bb=None,
         classifier_free_prob=0,
@@ -146,7 +148,6 @@ class GNN_Diffusion(pl.LightningModule):
         model_mean_type: ModelMeanType = ModelMeanType.EPSILON,
         input_channels=2,
         output_channels=2,
-        rough_condition_dropout=0.25,
         scheduler: ModelScheduler = ModelScheduler.LINEAR,
         visual_pretrained: bool = True,
         freeze_backbone: bool = True,
@@ -169,13 +170,13 @@ class GNN_Diffusion(pl.LightningModule):
         self.model_mean_type = model_mean_type
         self.backbone_learning_rate = backbone_learning_rate
         self.head_learning_rate = head_learning_rate
+        self.backbone_weight_decay = backbone_weight_decay
+        self.head_weight_decay = head_weight_decay
         self.save_and_sample_every = save_and_sample_every
         self.classifier_free_prob = classifier_free_prob
         self.classifier_free_w = classifier_free_w
         self.noise_weight = noise_weight
         self.rotation = rotation
-        
-        self.rough_condition_dropout = rough_condition_dropout
 
         self.virt_nodes = virt_nodes
         self.all_equivariant = all_equivariant
@@ -290,22 +291,15 @@ class GNN_Diffusion(pl.LightningModule):
     #     self.metrics = nn.ModuleDict(metrics)
     
     def initialize_torchmetrics(self, n_patches=None):
+        metric_names = ["mse", "mae", "mean_dist", "x_mae", "y_mae", "x_mse", "y_mse", "rough_mean_dist", "rough_x_mae", "rough_y_mae"]
         self.metrics = nn.ModuleDict({
-            "val_mse": torchmetrics.MeanMetric(),
-            "val_mae": torchmetrics.MeanMetric(),
-            "val_mean_dist": torchmetrics.MeanMetric(),
-            "val_x_mae": torchmetrics.MeanMetric(),
-            "val_y_mae": torchmetrics.MeanMetric(),
-            "val_x_mse": torchmetrics.MeanMetric(),
-            "val_y_mse": torchmetrics.MeanMetric(),
-
-            # "val_zero_mse": torchmetrics.MeanMetric(),
-            # "val_zero_mae": torchmetrics.MeanMetric(),
-            # "val_zero_mean_dist": torchmetrics.MeanMetric(),
+            f"{split}_{name}": torchmetrics.MeanMetric()
+            for split in ["val", "test"]
+            for name in metric_names
         })
 
-    def forward(self, xy_pos, time, patch_rgb, edge_index, batch, is_anchor=None, rough_delta=None, rough_radius=None, rough_valid=None) -> Any:
-        return self.model(xy_pos, time, patch_rgb, edge_index, batch, is_anchor=is_anchor, rough_delta=rough_delta, rough_radius=rough_radius, rough_valid=rough_valid)
+    def forward(self, xy_pos, time, patch_rgb, edge_index, edge_attr, batch, is_anchor=None, rough_delta=None, rough_radius=None) -> Any:
+        return self.model(xy_pos, time, patch_rgb, edge_index, edge_attr, batch, is_anchor=is_anchor, rough_delta=rough_delta, rough_radius=rough_radius)
         # # mean = patch_rgb.new_tensor([0.4850, 0.4560, 0.4060])[None, :, None, None]
         # # std = patch_rgb.new_tensor([0.2290, 0.2240, 0.2250])[None, :, None, None]
         # # if patch_feats == None:
@@ -331,16 +325,16 @@ class GNN_Diffusion(pl.LightningModule):
         xy_pos: Tensor,
         time: Tensor,
         edge_index: Tensor,
+        edge_attr: Tensor,
         patch_feats: Tensor,
         batch,
         is_anchor=None,
         rough_delta=None,
         rough_radius=None,
-        rough_valid=None,
         return_attentions=False,
     ) -> Any:
         out, attentions = self.model.forward_with_feats(
-            xy_pos, time, edge_index, patch_feats, batch, is_anchor=is_anchor, rough_delta=rough_delta, rough_radius=rough_radius, rough_valid=rough_valid
+            xy_pos, time, edge_index, edge_attr, patch_feats, batch, is_anchor=is_anchor, rough_delta=rough_delta, rough_radius=rough_radius
         )
         if return_attentions:
             return out, attentions
@@ -380,11 +374,11 @@ class GNN_Diffusion(pl.LightningModule):
         loss_type="l1",
         cond=None,
         edge_index=None,
+        edge_attr=None,
         batch=None,
         is_anchor=None,
         rough_delta=None,
         rough_radius=None,
-        rough_valid=None
     ):
         if noise is None:
             noise = torch.randn_like(x_start)
@@ -392,62 +386,23 @@ class GNN_Diffusion(pl.LightningModule):
         x_noisy = self.q_sample(x_start=x_start, t=t, noise=noise, is_anchor=is_anchor)
         if self.steps == 1:  # Transformer case
             x_noisy = torch.zeros_like(x_noisy)
-        # if self.rotation:
 
         patch_feats = self.visual_features(cond)
-        # batch_size = batch.max() + 1
-        # batch_one_hot = torch.nn.functional.one_hot(batch)
-        # prob = (
-        #    batch_one_hot.float() @ torch.rand(batch_size, device=self.device)
-        #    > self.classifier_free_prob
-        # )
-        # classifier_free_patch_feats = prob[:, None] * patch_feats
         
         rough_delta_cond = rough_delta
         rough_radius_cond = rough_radius
-
-        if rough_delta is not None and rough_radius is not None:
-            # Default: rough condition is available.
-            rough_valid = torch.ones(
-                (rough_delta.shape[0], 1),
-                device=rough_delta.device,
-                dtype=rough_delta.dtype,
-            )
-
-            if self.training and self.rough_condition_dropout > 0.0:
-                # one dropout decision per graph
-                num_graphs = int(batch.max().item()) + 1
-
-                keep_graph = (
-                    torch.rand(num_graphs, device=rough_delta.device)
-                    >= self.rough_condition_dropout
-                )
-
-                keep_node = keep_graph[batch].unsqueeze(-1)
-
-                # Remove the rough coordinate when this condition is dropped
-                rough_delta_cond = rough_delta * keep_node
-
-                # Keep radius unchanged; rough_valid tells the model whether
-                # the rough coordinate is actually available.
-                rough_radius_cond = rough_radius
-
-                rough_valid = keep_node.to(dtype=rough_delta.dtype)
-
-        else:
-            rough_valid = None
 
         prediction = self.forward_with_feats(
             x_noisy,
             t,
             edge_index,
+            edge_attr,
             patch_feats=patch_feats,  # classifier_free_patch_feats,
             batch=batch,
             return_attentions=False,
             is_anchor=is_anchor,
             rough_delta=rough_delta_cond,
             rough_radius=rough_radius_cond,
-            rough_valid=rough_valid,
         )
 
         target = {
@@ -459,6 +414,9 @@ class GNN_Diffusion(pl.LightningModule):
             target = target[keep]
             prediction = prediction[keep]
             
+        pred_correction_magnitude = torch.norm(prediction, dim=1).mean()
+        target_correction_magnitude = torch.norm(target, dim=1).mean()
+            
         diff = prediction - target
 
         train_stats = {
@@ -466,6 +424,8 @@ class GNN_Diffusion(pl.LightningModule):
             "train_y_mae_norm": diff[:, 1].abs().mean(),
             "train_x_rmse_norm": torch.sqrt((diff[:, 0] ** 2).mean()),
             "train_y_rmse_norm": torch.sqrt((diff[:, 1] ** 2).mean()),
+            "train_pred_correction_mag": pred_correction_magnitude,
+            "train_target_correction_mag": target_correction_magnitude,
         }
 
         if loss_type == "l1":
@@ -473,14 +433,21 @@ class GNN_Diffusion(pl.LightningModule):
         elif loss_type == "l2":
             loss = F.mse_loss(target, prediction)
         elif loss_type == "huber":
-            loss = F.smooth_l1_loss(target, prediction)
+            # loss = F.smooth_l1_loss(target, prediction)
+            loss_x = F.smooth_l1_loss(prediction[:, 0], target[:, 0])
+            loss_y = F.smooth_l1_loss(prediction[:, 1], target[:, 1])
         else:
             raise NotImplementedError()
+        
+        loss = loss_x + loss_y
+
+        # train_stats["train_loss_x"] = loss_x
+        # train_stats["train_loss_y"] = loss_y
 
         return loss, train_stats
 
     @torch.no_grad()
-    def p_sample_ddpm(self, x, t, t_index, cond, edge_index, patch_feats, batch, is_anchor=None, rough_delta=None, rough_radius=None, rough_valid=None):
+    def p_sample_ddpm(self, x, t, t_index, cond, edge_index, edge_attr, patch_feats, batch, is_anchor=None, rough_delta=None, rough_radius=None):
         betas_t = extract(self.betas, t, x.shape)
         sqrt_one_minus_alphas_cumprod_t = extract(
             self.sqrt_one_minus_alphas_cumprod, t, x.shape
@@ -493,7 +460,7 @@ class GNN_Diffusion(pl.LightningModule):
             x
             - betas_t
             * self.forward_with_feats(
-                x, t, edge_index, patch_feats=patch_feats, batch=batch, is_anchor=is_anchor, rough_delta=rough_delta, rough_radius=rough_radius, rough_valid=rough_valid
+                x, t, edge_index, edge_attr, patch_feats=patch_feats, batch=batch, is_anchor=is_anchor, rough_delta=rough_delta, rough_radius=rough_radius
             )
             / sqrt_one_minus_alphas_cumprod_t
         )
@@ -556,7 +523,7 @@ class GNN_Diffusion(pl.LightningModule):
 
     @torch.no_grad()
     def p_sample_ddim(
-        self, x, t, t_index, cond, edge_index, patch_feats, batch, is_anchor=None, rough_delta=None, rough_radius=None, rough_valid=None
+        self, x, t, t_index, cond, edge_index, edge_attr, patch_feats, batch, is_anchor=None, rough_delta=None, rough_radius=None
     ):  # (self, x, t, t_index, cond):
         if is_anchor is not None:
             anchor_mask = is_anchor.bool().view(-1, 1)
@@ -582,25 +549,25 @@ class GNN_Diffusion(pl.LightningModule):
                 x,
                 t,
                 edge_index,
+                edge_attr,
                 patch_feats=patch_feats,
                 batch=batch,
                 return_attentions=True,
                 is_anchor=is_anchor,
                 rough_delta=rough_delta,
                 rough_radius=rough_radius,
-                rough_valid=rough_valid
             )
 
             model_output_uncond = self.forward_with_feats(
                 x,
                 t,
                 edge_index,
+                edge_attr,
                 patch_feats=torch.zeros_like(patch_feats),
                 batch=batch,
                 is_anchor=is_anchor,
                 rough_delta=rough_delta,
                 rough_radius=rough_radius,
-                rough_valid=rough_valid
             )
 
             model_output = (
@@ -612,13 +579,13 @@ class GNN_Diffusion(pl.LightningModule):
                 x,
                 t,
                 edge_index,
+                edge_attr=edge_attr,
                 patch_feats=patch_feats,
                 batch=batch,
                 return_attentions=True,
                 is_anchor=is_anchor,
                 rough_delta=rough_delta,
                 rough_radius=rough_radius,
-                rough_valid=rough_valid
             )
 
         x_0 = {
@@ -663,21 +630,12 @@ class GNN_Diffusion(pl.LightningModule):
 
     # Algorithm 2 but save all images:
     @torch.no_grad()
-    def p_sample_loop(self, shape, cond, edge_index, batch, is_anchor=None, rough_delta=None, rough_radius=None, rough_valid=None):
+    def p_sample_loop(self, shape, cond, edge_index, edge_attr, batch, is_anchor=None, rough_delta=None, rough_radius=None):
         # device = next(model.parameters()).device
         device = self.device
 
         b = shape[0]
         # start from pure noise (for each example in the batch)
-        
-        if (rough_valid is None and rough_delta is not None and rough_radius is not None):
-            rough_valid = torch.ones((rough_delta.shape[0], 1), device=rough_delta.device, dtype=rough_delta.dtype)
-            
-        if self.global_rank == 0 and rough_valid is not None:
-            print(
-                "sampling rough_valid unique:",
-                rough_valid.unique()
-            )
         
         img = torch.randn(shape, device=device) * self.noise_weight
         print("initial img std:", img.std().item(), "min:", img.min().item(), "max:", img.max().item())
@@ -688,8 +646,9 @@ class GNN_Diffusion(pl.LightningModule):
         #     w1=self.patches,
         # )
 
-        imgs = []
-        attentions = []
+        # imgs = []
+        # attentions = []
+        atts = None
 
         patch_feats = self.visual_features(cond)
 
@@ -708,27 +667,27 @@ class GNN_Diffusion(pl.LightningModule):
                 i,
                 cond=cond,
                 edge_index=edge_index,
+                edge_attr=edge_attr,
                 patch_feats=patch_feats,
                 batch=batch,
                 is_anchor=is_anchor,
                 rough_delta=rough_delta,
                 rough_radius=rough_radius,
-                rough_valid=rough_valid
             )
             
             if is_anchor is not None:
                 anchor_mask = is_anchor.bool().view(-1, 1)
                 img[anchor_mask.expand_as(img)] = 0.0
 
-            attentions.append(atts)
-            imgs.append(img)
-        return imgs, attentions
+            # attentions.append(atts)
+            # imgs.append(img)
+        return img, atts
 
     @torch.no_grad()
     def p_sample(
-        self, x, t, t_index, cond, edge_index, sampling_func, patch_feats, batch, is_anchor=None, rough_delta=None, rough_radius=None, rough_valid=None
+        self, x, t, t_index, cond, edge_index, edge_attr, sampling_func, patch_feats, batch, is_anchor=None, rough_delta=None, rough_radius=None,
     ):
-        return sampling_func(x, t, t_index, cond, edge_index, patch_feats, batch, is_anchor=is_anchor, rough_delta=rough_delta, rough_radius=rough_radius, rough_valid=rough_valid)
+        return sampling_func(x, t, t_index, cond, edge_index, edge_attr, patch_feats, batch, is_anchor=is_anchor, rough_delta=rough_delta, rough_radius=rough_radius)
 
     @torch.no_grad()
     def sample(
@@ -738,25 +697,20 @@ class GNN_Diffusion(pl.LightningModule):
         channels=3,
         cond=None,
         edge_index=None,
+        edge_attr=None,
         batch=None,
     ):
         return self.p_sample_loop(
             shape=(batch_size, channels, image_size, image_size),
             cond=cond,
             edge_index=edge_index,
+            edge_attr=edge_attr,
             batch=batch,
             is_anchor=batch.is_anchor,
             rough_delta=batch.rough_delta_model,
             rough_radius=batch.rough_radius_model
         )
 
-    # def configure_optimizers(self):
-    #     # optimizer = torch.optim.Adagrad(self.parameters(), lr=self.learning_rate)
-    #     # optimizer = Adafactor(self.parameters())
-    #     # optimizer = Adafactor(self.parameters())
-    #     # return optimizer
-    #     optimizer = torch.optim.Adam(self.parameters(), lr=self.learning_rate)
-    #     return optimizer
     def configure_optimizers(self):
         backbone_params = list(self.model.visual_backbone.parameters())
         backbone_param_ids = {id(p) for p in backbone_params}
@@ -766,9 +720,9 @@ class GNN_Diffusion(pl.LightningModule):
             if id(p) not in backbone_param_ids
         ]
 
-        optimizer = torch.optim.Adam([
-            {"params": backbone_params, "lr": self.backbone_learning_rate},
-            {"params": other_params, "lr": self.head_learning_rate},
+        optimizer = torch.optim.AdamW([
+            {"params": backbone_params, "lr": self.backbone_learning_rate, "weight_decay": self.backbone_weight_decay},
+            {"params": other_params, "lr": self.head_learning_rate, "weight_decay": self.head_weight_decay},
         ])
 
         return optimizer
@@ -791,17 +745,31 @@ class GNN_Diffusion(pl.LightningModule):
 
     def training_step(self, batch, batch_idx):
         with torch.enable_grad():
+            # Temporary sanity checks
+            assert batch.correction_scale.view(-1, 2).shape[1] == 2
+            assert torch.isfinite(batch.x).all()
+            assert torch.isfinite(batch.rough_delta).all()
+            assert torch.isfinite(batch.correction_scale).all()
+            
+            assert batch.edge_attr.ndim == 2
+            assert batch.edge_attr.shape[0] == batch.edge_index.shape[1]
+            assert batch.edge_attr.shape[1] == 2
+            assert torch.isfinite(batch.edge_attr).all()
+        
             batch_size = batch.batch.max().item() + 1
             t = torch.randint(0, self.steps, (batch_size,), device=self.device).long()
             new_t = torch.gather(t, 0, batch.batch)
             
             if batch_idx == 0 and self.local_rank == 0:
-                print("gt_delta_model:", batch.x[:5])
+                print("correction_model:", batch.x[:5])
+                print("gt_delta_model:", batch.gt_delta_model[:5])
                 print("rough_delta_model:", batch.rough_delta_model[:5])
                 print("rough_radius_model:", batch.rough_radius_model[:5])
 
-                rough_error = batch.rough_delta_model - batch.x
-                print("rough error mean:", torch.norm(rough_error, dim=1).mean().item())
+                rough_error = batch.rough_delta_model - batch.gt_delta_model
+                print("correction x MAE:", batch.x[:, 0].abs().mean().item())
+                print("correction y MAE:", batch.x[:, 1].abs().mean().item())
+                print("correction target magnitude:", torch.norm(batch.x, dim=1).mean().item())
 
             loss, train_stats = self.p_losses(
                 batch.x,
@@ -809,6 +777,7 @@ class GNN_Diffusion(pl.LightningModule):
                 loss_type="huber",
                 cond=batch.patches,
                 edge_index=batch.edge_index,
+                edge_attr=batch.edge_attr,
                 batch=batch.batch,
                 is_anchor=batch.is_anchor,
                 rough_delta=batch.rough_delta_model,
@@ -819,30 +788,36 @@ class GNN_Diffusion(pl.LightningModule):
 
         if not self.all_equivariant:
             if batch_idx == 0 and self.local_rank == 0:
-                imgs, _ = self.p_sample_loop(
+                img, _ = self.p_sample_loop(
                     batch.x.shape,
                     batch.patches,
                     batch.edge_index,
+                    batch.edge_attr,
                     batch=batch.batch,
                     is_anchor=batch.is_anchor,
                     rough_delta=batch.rough_delta_model,
                     rough_radius=batch.rough_radius_model,
                 )
 
-                img = imgs[-1]
+                # img = imgs[-1]
                 save_path = Path(f"results/{self.logger.experiment.name}/train")
 
-                for i in range(min(batch.batch.max().item() + 1, 4)):
+                for i in range(batch.batch.max().item() + 1):
                     idx = torch.where(batch.batch == i)[0]
                     
-                    scale = batch.delta_scale.view(-1, 2)[i]
-                    pred_pos = img[idx, :2] * scale
+                    # scale = batch.delta_scale.view(-1, 2)[i]
+                    # pred_correction_model = img[idx, :2]
+                    # pred_position_model = (batch.rough_delta_model[idx, :2] + pred_correction_model)
+                    # pred_pos = pred_position_model * scale
+                    
+                    correction_scale = batch.correction_scale.view(-1, 2)[i]
+                    pred_correction_model = img[idx, :2]
+                    pred_correction = pred_correction_model * correction_scale
+                    pred_pos = batch.rough_delta[idx, :2] + pred_correction
+                    
                     gt_pos = batch.gt_delta[idx, :2]
 
                     self.save_oct_image(
-                        # patches_rgb=batch.patches[idx],
-                        # pos=img[idx],
-                        # gt_pos=batch.x[idx],
                         patches_rgb=batch.patches[idx],
                         pos=pred_pos,
                         gt_pos=gt_pos,
@@ -855,8 +830,6 @@ class GNN_Diffusion(pl.LightningModule):
                         dense_imgs=batch.dense_imgs[i],
                         dense_scan_indices=batch.dense_scan_indices[i],
                         dense_y=batch.dense_y[i],
-                        # xlim=batch.xlim[i],
-                        # ylim=batch.ylim[i],
                         xlim=batch.xlim.view(-1, 2)[i],
                         ylim=batch.ylim.view(-1, 2)[i],
                         full_width=batch.full_width[i],
@@ -872,173 +845,111 @@ class GNN_Diffusion(pl.LightningModule):
     @torch.no_grad()
     def prediction_step(self, batch, batch_idx):
         indexes = self.p_sample_loop(
-            batch.x.shape, batch.patches, batch.edge_index, batch=batch.batch, is_anchor=batch.is_anchor, rough_delta=batch.rough_delta_model, rough_radius=batch.rough_radius_model
+            batch.x.shape, batch.patches, batch.edge_index, batch.edge_attr, batch=batch.batch, is_anchor=batch.is_anchor, rough_delta=batch.rough_delta_model, rough_radius=batch.rough_radius_model
         )
         return indexes
     
-    # def validation_step(self, batch, batch_idx):
-    #     with torch.no_grad():
-    #         imgs, _ = self.p_sample_loop(
-    #             batch.x.shape,
-    #             batch.patches,
-    #             batch.edge_index,
-    #             batch=batch.batch,
-    #             is_anchor=batch.is_anchor,
-    #         )
-
-    #         img = imgs[-1]
-
-    #         for i in range(batch.batch.max().item() + 1):
-    #             idx = torch.where(batch.batch == i)[0]
-
-    #             patches_rgb = batch.patches[idx]
-    #             gt_pos = batch.x[idx, :2]
-    #             raw_pos = batch.raw_xy[idx, :2]
-    #             pos = img[idx, :2]
-    #             i_name = batch.ind_name[i]
-
-    #             non_anchor = ~batch.is_anchor[idx].bool().view(-1)
-
-    #             eval_pos = pos[non_anchor]
-    #             eval_gt = gt_pos[non_anchor]
-
-    #             diff = eval_pos - eval_gt
-    #             mse = torch.mean(diff ** 2)
-    #             rmse = torch.sqrt(mse)
-    #             mae = torch.mean(torch.abs(diff))
-    #             mean_dist = torch.norm(diff, dim=1).mean()
-
-    #             self.metrics["val_mse"].update(mse)
-    #             self.metrics["val_rmse"].update(rmse)
-    #             self.metrics["val_mae"].update(mae)
-    #             self.metrics["val_mean_dist"].update(mean_dist)
-
-    #             if self.local_rank == 0 and batch_idx == 0 and i < 4:
-    #                 save_path = Path(f"results/{self.logger.experiment.name}/val")
-
-    #                 self.save_oct_image(
-    #                     patches_rgb=patches_rgb,
-    #                     pos=pos,
-    #                     gt_pos=gt_pos,
-    #                     raw_pos=raw_pos,
-    #                     scan_indices=batch.scan_indices[idx],
-    #                     batch_ids=batch.batch_ids[idx],
-    #                     is_anchor=batch.is_anchor[idx],
-    #                     ind_name=i_name,
-    #                     file_name=save_path,
-    #                     dense_imgs=batch.dense_imgs[i],
-    #                     dense_scan_indices=batch.dense_scan_indices[i],
-    #                     dense_y=batch.dense_y[i],
-    #                     # xlim=batch.xlim[i],
-    #                     # ylim=batch.ylim[i],
-    #                     xlim=batch.xlim.view(-1, 2)[i],
-    # ylim=batch.ylim.view(-1, 2)[i],
-    #                     full_width=batch.full_width[i],
-    #                     crop_display_width=batch.crop_display_width[i],
-    #                     display_height=batch.display_height[i],
-    #                     title_prefix="val",
-    #                 )
-
-    #         self.log_dict(self.metrics)
-    def validation_step(self, batch, batch_idx):
+    @torch.no_grad()
+    def shared_eval_step(self, batch, batch_idx, split):
         devices = [self.device.index] if self.device.type == "cuda" else []
 
-        with torch.no_grad(), torch.random.fork_rng(devices=devices):
-            # Different deterministic noise per validation batch,
-            # but identical across validation epochs.
-            seed = 100000 + batch_idx
+        with torch.random.fork_rng(devices=devices):
+            seed_offset = 100000 if split == "val" else 200000
+            seed = seed_offset + batch_idx
+
             torch.manual_seed(seed)
 
             if self.device.type == "cuda":
                 torch.cuda.manual_seed(seed)
 
-            imgs, _ = self.p_sample_loop(
+            img, _ = self.p_sample_loop(
                 batch.x.shape,
                 batch.patches,
                 batch.edge_index,
+                batch.edge_attr,
                 batch=batch.batch,
                 is_anchor=batch.is_anchor,
                 rough_delta=batch.rough_delta_model,
-                rough_radius=batch.rough_radius_model
+                rough_radius=batch.rough_radius_model,
             )
 
-        img = imgs[-1]
+        # img = imgs[-1]
 
-        for i in range(batch.batch.max().item() + 1):
+        # for i in range(int(batch.batch.max().item()) + 1):
+        for i in range(min(batch.batch.max().item() + 1, 4)):
             idx = torch.where(batch.batch == i)[0]
 
-            # patches_rgb = batch.patches[idx]
-            # gt_pos = batch.x[idx, :2]
-            # raw_pos = batch.raw_xy[idx, :2]
-            # pos = img[idx, :2]
-            i_name = batch.ind_name[i]
-            
-            patches_rgb = batch.patches[idx]
-            raw_pos = batch.raw_xy[idx, :2]
-
-            # Per-graph conversion scale.
             scale = batch.delta_scale.view(-1, 2)[i]
 
-            # Normalized prediction from diffusion.
-            pos_model = img[idx, :2]
-
-            # Convert prediction back to original coordinates.
-            pos = pos_model * scale
-
-            # Original-coordinate ground truth.
+            # Convert model-space values back to original coordinate units.
+            # pred_correction_model = img[idx, :2]
+            # pred_position_model = (batch.rough_delta_model[idx, :2] + pred_correction_model)
+            # pred_pos = pred_position_model * scale
+            # gt_pos = batch.gt_delta[idx, :2]
+            # rough_pos = batch.rough_delta_model[idx, :2] * scale
+            
+            correction_scale = batch.correction_scale.view(-1, 2)[i]
+            pred_correction_model = img[idx, :2]
+            pred_correction = pred_correction_model * correction_scale
+            pred_pos = batch.rough_delta[idx, :2] + pred_correction
             gt_pos = batch.gt_delta[idx, :2]
+            rough_pos = batch.rough_delta[idx, :2]
 
             non_anchor = ~batch.is_anchor[idx].bool().view(-1)
-            eval_pos = pos[non_anchor]
-            eval_gt = gt_pos[non_anchor]
 
-            if eval_pos.numel() == 0:
+            pred_eval = pred_pos[non_anchor]
+            gt_eval = gt_pos[non_anchor]
+            rough_eval = rough_pos[non_anchor]
+
+            if pred_eval.numel() == 0:
                 continue
 
-            zero_diff = -eval_gt
-            zero_mse = torch.mean(zero_diff ** 2)
-            zero_mae = torch.mean(torch.abs(zero_diff))
-            zero_mean_dist = torch.norm(zero_diff, dim=1).mean()
+            diff = pred_eval - gt_eval
+            rough_diff = rough_eval - gt_eval
 
-            diff = eval_pos - eval_gt
             num_nodes = diff.shape[0]
             num_values = diff.numel()
 
             mse = torch.mean(diff ** 2)
             mae = torch.mean(torch.abs(diff))
             mean_dist = torch.norm(diff, dim=1).mean()
-            
+
             x_mae = torch.abs(diff[:, 0]).mean()
             y_mae = torch.abs(diff[:, 1]).mean()
 
             x_mse = torch.mean(diff[:, 0] ** 2)
             y_mse = torch.mean(diff[:, 1] ** 2)
 
-            self.metrics["val_mse"].update(mse, weight=num_values)
-            self.metrics["val_mae"].update(mae, weight=num_values)
-            self.metrics["val_mean_dist"].update(mean_dist, weight=num_nodes)
+            rough_mean_dist = torch.norm(rough_diff, dim=1).mean()
+            rough_x_mae = torch.abs(rough_diff[:, 0]).mean()
+            rough_y_mae = torch.abs(rough_diff[:, 1]).mean()
 
-            self.metrics["val_x_mae"].update(x_mae, weight=num_nodes)
-            self.metrics["val_y_mae"].update(y_mae, weight=num_nodes)
-            self.metrics["val_x_mse"].update(x_mse, weight=num_nodes)
-            self.metrics["val_y_mse"].update(y_mse, weight=num_nodes)
-            
-            # self.metrics["val_zero_mse"].update(zero_mse, weight=num_values)
-            # self.metrics["val_zero_mae"].update(zero_mae, weight=num_values)
-            # self.metrics["val_zero_mean_dist"].update(zero_mean_dist, weight=num_nodes)
+            self.metrics[f"{split}_mse"].update(mse, weight=num_values)
+            self.metrics[f"{split}_mae"].update(mae, weight=num_values)
+            self.metrics[f"{split}_mean_dist"].update(mean_dist, weight=num_nodes)
 
-            if self.local_rank == 0 and batch_idx == 0 and i < 4:
-                save_path = Path(f"results/{self.logger.experiment.name}/val")
+            self.metrics[f"{split}_x_mae"].update(x_mae, weight=num_nodes)
+            self.metrics[f"{split}_y_mae"].update(y_mae, weight=num_nodes)
+            self.metrics[f"{split}_x_mse"].update(x_mse, weight=num_nodes)
+            self.metrics[f"{split}_y_mse"].update(y_mse, weight=num_nodes)
+
+            self.metrics[f"{split}_rough_mean_dist"].update(rough_mean_dist, weight=num_nodes)
+            self.metrics[f"{split}_rough_x_mae"].update(rough_x_mae, weight=num_nodes)
+            self.metrics[f"{split}_rough_y_mae"].update(rough_y_mae, weight=num_nodes)
+
+            # Save only a limited number of fixed examples.
+            if self.global_rank == 0 and batch_idx < 4 and i < 2:
+                save_path = Path(f"results/{self.logger.experiment.name}/{split}")
 
                 self.save_oct_image(
-                    patches_rgb=patches_rgb,
-                    pos=pos,
+                    patches_rgb=batch.patches[idx],
+                    pos=pred_pos,
                     gt_pos=gt_pos,
-                    raw_pos=raw_pos,
+                    raw_pos=batch.raw_xy[idx, :2],
                     scan_indices=batch.scan_indices[idx],
                     batch_ids=batch.batch_ids[idx],
                     is_anchor=batch.is_anchor[idx],
-                    ind_name=i_name,
+                    ind_name=batch.ind_name[i],
                     file_name=save_path,
                     dense_imgs=batch.dense_imgs[i],
                     dense_scan_indices=batch.dense_scan_indices[i],
@@ -1048,299 +959,61 @@ class GNN_Diffusion(pl.LightningModule):
                     full_width=batch.full_width[i],
                     crop_display_width=batch.crop_display_width[i],
                     display_height=batch.display_height[i],
-                    title_prefix="val",
+                    title_prefix=split,
                 )
+            
+    def validation_step(self, batch, batch_idx):
+        self.shared_eval_step(batch, batch_idx, split="val")
+        
+        
+    def shared_eval_epoch_end(self, split):
+        mse = self.metrics[f"{split}_mse"].compute()
+        mae = self.metrics[f"{split}_mae"].compute()
+        mean_dist = self.metrics[f"{split}_mean_dist"].compute()
 
-    # def validation_epoch_end(self, outputs) -> None:
-    #     self.log_dict(self.metrics)
+        x_mae = self.metrics[f"{split}_x_mae"].compute()
+        y_mae = self.metrics[f"{split}_y_mae"].compute()
+
+        x_rmse = torch.sqrt(self.metrics[f"{split}_x_mse"].compute())
+        y_rmse = torch.sqrt(self.metrics[f"{split}_y_mse"].compute())
+
+        rough_mean_dist = self.metrics[f"{split}_rough_mean_dist"].compute()
+        rough_x_mae = self.metrics[f"{split}_rough_x_mae"].compute()
+        rough_y_mae = self.metrics[f"{split}_rough_y_mae"].compute()
+
+        rmse = torch.sqrt(mse)
+        improvement = rough_mean_dist - mean_dist
+        relative_improvement = improvement / rough_mean_dist.clamp_min(1e-8)
+
+        self.log(f"{split}_mse", mse, sync_dist=True)
+        self.log(f"{split}_rmse", rmse, sync_dist=True)
+        self.log(f"{split}_mae", mae, sync_dist=True)
+        self.log(f"{split}_mean_dist", mean_dist, prog_bar=True, sync_dist=True)
+
+        self.log(f"{split}_x_mae", x_mae, sync_dist=True)
+        self.log(f"{split}_y_mae", y_mae, sync_dist=True)
+        self.log(f"{split}_x_rmse", x_rmse, sync_dist=True)
+        self.log(f"{split}_y_rmse", y_rmse, sync_dist=True)
+
+        self.log(f"{split}_rough_mean_dist", rough_mean_dist, sync_dist=True)
+        self.log(f"{split}_rough_x_mae", rough_x_mae, sync_dist=True)
+        self.log(f"{split}_rough_y_mae", rough_y_mae, sync_dist=True)
+
+        self.log(f"{split}_mean_dist_improvement", improvement, sync_dist=True)
+        self.log(f"{split}_relative_improvement", relative_improvement, sync_dist=True)
+
+        for name, metric in self.metrics.items():
+            if name.startswith(f"{split}_"):
+                metric.reset()
     
     def validation_epoch_end(self, outputs):
-        val_mse = self.metrics["val_mse"].compute()
-        val_mae = self.metrics["val_mae"].compute()
-        val_mean_dist = self.metrics["val_mean_dist"].compute()
-
-        # Derived from the globally aggregated MSE
-        val_rmse = torch.sqrt(val_mse)
-        
-        val_x_mae = self.metrics["val_x_mae"].compute()
-        val_y_mae = self.metrics["val_y_mae"].compute()
-
-        val_x_rmse = torch.sqrt(self.metrics["val_x_mse"].compute())
-        val_y_rmse = torch.sqrt(self.metrics["val_y_mse"].compute())
-
-        self.log("val_x_mae", val_x_mae)
-        self.log("val_y_mae", val_y_mae)
-        self.log("val_x_rmse", val_x_rmse)
-        self.log("val_y_rmse", val_y_rmse)
-
-        self.log("val_mse", val_mse, sync_dist=True)
-        self.log("val_rmse", val_rmse, prog_bar=True, sync_dist=True)
-        self.log("val_mae", val_mae, sync_dist=True)
-        self.log("val_mean_dist", val_mean_dist, prog_bar=True, sync_dist=True)
-        
-        # val_zero_mse = self.metrics["val_zero_mse"].compute()
-        # val_zero_mae = self.metrics["val_zero_mae"].compute()
-        # val_zero_mean_dist = self.metrics["val_zero_mean_dist"].compute()
-
-        # self.log("val_zero_mse", val_zero_mse, sync_dist=True)
-        # self.log("val_zero_rmse", torch.sqrt(val_zero_mse), sync_dist=True)
-        # self.log("val_zero_mae", val_zero_mae, sync_dist=True)
-        # self.log("val_zero_mean_dist", val_zero_mean_dist, sync_dist=True)
-
-        for metric in self.metrics.values():
-            metric.reset()
+        self.shared_eval_epoch_end("val")
 
     def test_epoch_end(self, outputs) -> None:
-        return self.validation_epoch_end(outputs)
+        self.shared_eval_epoch_end("test")
 
     def test_step(self, batch, batch_idx, *args, **kwargs):
-        return self.validation_step(batch, batch_idx)
-
-    # def test_step(self, batch, batch_idx):
-    #     with torch.no_grad():
-    #         imgs, attentions = self.p_sample_loop(
-    #             batch.x.shape, batch.patches, batch.edge_index, batch=batch.batch
-    #         )
-
-    #         img = imgs[-1]
-
-    #         for i in range(batch.batch.max() + 1):
-    #             idx = torch.where(batch.batch == i)[0]
-    #             patches_rgb = batch.patches[idx]
-    #             gt_pos = batch.x[idx, :2]
-    #             pos = img[idx, :2]
-    #             n_patches = batch.patches_dim[i].tolist()
-    #             i_name = batch.ind_name[i]
-
-    #             y = torch.linspace(-1, 1, n_patches[0], device=self.device)
-    #             x = torch.linspace(-1, 1, n_patches[1], device=self.device)
-    #             xy = torch.stack(torch.meshgrid(x, y, indexing="xy"), -1)
-    #             real_grid = einops.rearrange(xy, "x y c-> (x y) c")
-
-    #             gt_ass = greedy_cost_assignment(gt_pos, real_grid)
-    #             sort_idx = torch.sort(gt_ass[:, 0])[1]
-    #             gt_ass = gt_ass[sort_idx]
-
-    #             pred_ass = greedy_cost_assignment(pos, real_grid)
-    #             sort_idx = torch.sort(pred_ass[:, 0])[1]
-    #             pred_ass = pred_ass[sort_idx]
-
-    #             correct = (gt_ass[:, 1] == pred_ass[:, 1]).all()
-
-    #             piece_accuracy = (gt_ass[:, 1] == pred_ass[:, 1]).to(self.device)
-    #             if self.rotation:
-    #                 pred_rot = img[idx, 2:]
-    #                 gt_rot = batch.x[idx, 2:]
-
-    #                 rot_correct = torch.cosine_similarity(pred_rot, gt_rot) > math.cos(
-    #                     math.pi / 4
-    #                 )
-    #                 correct = correct and rot_correct.all()
-    #                 piece_accuracy = rot_correct * piece_accuracy
-
-    #             if self.save_eval_images:
-    #                 for id_t, t_img in enumerate(imgs):
-    #                     t_res = t_img[idx]
-
-    #                     pred_pos = t_res[:, :2]
-    #                     pred_rot = t_res[:, 2:]
-    #                     fig, ax = plt.subplots(2, 1, figsize=(10, 15))
-
-    #                     img_plot = self.create_image_from_patches(
-    #                         patches_rgb,
-    #                         pred_pos,
-    #                         n_patches=n_patches,
-    #                         i=i_name,
-    #                         rotations=pred_rot,
-    #                     )
-
-    #                     ax[0].imshow(img_plot)
-    #                     # ax[0].set_axis_off()
-    #                     ax[0].set_xticks([])
-    #                     ax[0].set_yticks([])
-
-    #                     # ax[0].patch.set_edgecolor("black")
-
-    #                     # ax[0].patch.set_linewidth("1")
-
-    #                     col = list(map(interpolate_color, gt_pos))
-    #                     pred_rot = F.normalize(pred_rot, dim=-1)
-
-    #                     rad_pred = torch.atan2(pred_rot[:, 1], pred_rot[:, 0])
-    #                     rad_gt = torch.atan2(gt_rot[:, 1], gt_rot[:, 0])
-
-    #                     diff_rad = (rad_gt - rad_pred) + math.pi / 2
-    #                     new_p = torch.stack(
-    #                         [torch.cos(diff_rad), torch.sin(diff_rad)], dim=-1
-    #                     )
-
-    #                     ax[1].quiver(
-    #                         pred_pos[:, 0].cpu(),
-    #                         pred_pos[:, 1].cpu(),
-    #                         new_p[:, 0].cpu(),
-    #                         new_p[:, 1].cpu(),
-    #                         color=col,
-    #                         pivot="middle",
-    #                         scale=10,
-    #                         width=0.01,
-    #                     )
-
-    #                     ax[1].set_aspect("equal")
-    #                     # ax[1].set_axis_off()
-    #                     ax[1].set_xlim(-1.2, 1.2)
-    #                     ax[1].set_ylim(-1.2, 1.2)
-
-    #                     ax[1].invert_yaxis()
-    #                     # ax[1].patch.set_edgecolor("black")
-
-    #                     # ax[1].patch.set_linewidth("1")
-
-    #                     ax[1].set_xticks([])
-    #                     ax[1].set_yticks([])
-
-    #                     save_path = f"results/{self.logger.experiment.name}/test/"
-    #                     save_path = Path(save_path)
-    #                     save_path.mkdir(parents=True, exist_ok=True)
-    #                     fig.savefig(
-    #                         save_path / f"{i_name}_{id_t:03d}.png",
-    #                         dpi=300,
-    #                         transparent=True,
-    #                     )
-    #                     plt.close(fig)
-
-    #                 ###### FINAL IMAGE ######
-
-    #                 # pred_pos = t_res[:, :2]
-    #                 pred_rot = t_res[:, 2:]
-
-    #                 # for the final image use the gt pos, sorted by the predicted assignement
-    #                 # pred_pos = gt_pos[pred_ass[:, 1]]
-    #                 pred_pos = real_grid[pred_ass[:, 1]]
-
-    #                 # snap the rotation to one of the four 90 degree rotations
-    #                 rad = torch.atan2(pred_rot[:, 1], pred_rot[:, 0])
-    #                 rad_snap = torch.round(rad / (torch.pi / 2)) * torch.pi / 2
-
-    #                 pred_rot = torch.stack(
-    #                     [torch.cos(rad_snap), torch.sin(rad_snap)], dim=-1
-    #                 )
-
-    #                 fig, ax = plt.subplots(2, 1, figsize=(10, 15))
-
-    #                 img_plot = self.create_image_from_patches(
-    #                     patches_rgb,
-    #                     pred_pos,
-    #                     n_patches=n_patches,
-    #                     i=i_name,
-    #                     rotations=pred_rot,
-    #                 )
-
-    #                 ax[0].imshow(img_plot)
-    #                 # ax[0].set_axis_off()
-    #                 ax[0].set_xticks([])
-    #                 ax[0].set_yticks([])
-
-    #                 # ax[0].patch.set_edgecolor("black")
-
-    #                 # ax[0].patch.set_linewidth("1")
-
-    #                 col = list(map(interpolate_color, gt_pos))
-    #                 pred_rot = F.normalize(pred_rot, dim=-1)
-
-    #                 rad_pred = torch.atan2(pred_rot[:, 1], pred_rot[:, 0])
-    #                 rad_gt = torch.atan2(gt_rot[:, 1], gt_rot[:, 0])
-
-    #                 diff_rad = (rad_gt - rad_pred) + math.pi / 2
-    #                 new_p = torch.stack(
-    #                     [torch.cos(diff_rad), torch.sin(diff_rad)], dim=-1
-    #                 )
-
-    #                 ax[1].quiver(
-    #                     pred_pos[:, 0].cpu(),
-    #                     pred_pos[:, 1].cpu(),
-    #                     new_p[:, 0].cpu(),
-    #                     new_p[:, 1].cpu(),
-    #                     color=col,
-    #                     pivot="middle",
-    #                     scale=10,
-    #                     width=0.01,
-    #                 )
-
-    #                 ax[1].set_aspect("equal")
-    #                 # ax[1].set_axis_off()
-    #                 ax[1].set_xlim(-1.2, 1.2)
-    #                 ax[1].set_ylim(-1.2, 1.2)
-
-    #                 ax[1].invert_yaxis()
-    #                 # ax[1].patch.set_edgecolor("black")
-
-    #                 # ax[1].patch.set_linewidth("1")
-
-    #                 ax[1].set_xticks([])
-    #                 ax[1].set_yticks([])
-
-    #                 save_path = f"results/{self.logger.experiment.name}/test/"
-    #                 save_path = Path(save_path)
-    #                 save_path.mkdir(parents=True, exist_ok=True)
-    #                 fig.savefig(
-    #                     save_path / f"{i_name}_final.png",
-    #                     dpi=300,
-    #                     transparent=True,
-    #                 )
-    #                 plt.close(fig)
-
-    #                 #######################
-
-    #             self.metrics[f"{tuple(n_patches)}_nImages"].update(1)
-    #             self.metrics["overall_nImages"].update(1)
-    #             self.metrics[f"{tuple(n_patches)}__piece_acc"].update(piece_accuracy)
-    #             if correct:
-    #                 # if (assignement[:, 0] == assignement[:, 1]).all():
-    #                 self.metrics[f"{tuple(n_patches)}_acc"].update(1)
-    #                 self.metrics["overall_acc"].update(1)
-    #                 # accuracy_dict[tuple(n_patches)].append(1)
-    #             else:
-    #                 self.metrics[f"{tuple(n_patches)}_acc"].update(0)
-    #                 self.metrics["overall_acc"].update(0)
-    #                 # accuracy_dict[tuple(n_patches)].append(0)
-
-    #         self.log_dict(self.metrics)
-
-        # return self.validation_step(batch, batch_idx)
-        # all_outs = self.all_gather(outputs)
-
-        ## mean = torch.mean(all_outs)
-        ## num_images = all_outs.shape[0]
-
-        # if self.local_rank == 0:
-        # out_dict = {}
-        # for d in all_outs:
-        # out_dict = {
-        # k: out_dict.get(k, []) + d.get(k, [])
-        # for k in out_dict.keys() | d.keys()
-        # }
-
-        # acc_dict = {}
-        # overall_acc = []
-        # for key, val in out_dict.items():
-        ## acc_dict[key] = {}
-        # arr = torch.stack(out_dict[key])
-        # acc_dict[f"{key}_acc"] = arr.float().mean()
-        # acc_dict[f"{key}_num_img"] = arr.shape[0]
-        # overall_acc.append(arr.float().mean())
-        # overall_acc = torch.stack(overall_acc).mean()  # torch.mean(overall_acc)
-        # self.log(
-        # "val",
-        # {"epoch": self.current_epoch, "overall_acc": overall_acc, **acc_dict},
-        # rank_zero_only=True,
-        # )
-        # self.log("val_acc", overall_acc, rank_zero_only=True)
-
-    # def on_validation_epoch_start(self) -> None:
-    #     self.accuracy_dict = defaultdict(lambda: [])
-
-    # def validation_step(self, batch, batch_idx, *args, **kwargs):
-    # return self.test_step(batch, batch_idx, *args, **kwargs)
+        self.shared_eval_step(batch, batch_idx, split="test")
 
     def on_predict_epoch_start(self):
         logging.info(f"Saving to results/{self.logger.experiment.name}/preds")
@@ -1348,7 +1021,7 @@ class GNN_Diffusion(pl.LightningModule):
     def predict_step(self, batch, batch_idx):
         with torch.no_grad():
             preds = self.p_sample_loop(
-                batch.x.shape, batch.patches, batch.edge_index, batch=batch.batch, is_anchor=batch.is_anchor, rough_delta=batch.rough_delta_model, rough_radius=batch.rough_radius_model
+                batch.x.shape, batch.patches, batch.edge_index, batch.edge_attr, batch=batch.batch, is_anchor=batch.is_anchor, rough_delta=batch.rough_delta_model, rough_radius=batch.rough_radius_model
             )
 
             for i in range(batch.batch.max() + 1):
@@ -1665,7 +1338,7 @@ class GNN_Diffusion(pl.LightningModule):
         ax.set_xlim(anchored_xlim)
         ax.set_ylim(anchored_ylim)
         ax.grid(alpha=0.3)
-        ax.set_title("Current diffusion state")
+        ax.set_title("Refined position")
         ax.set_xlabel("Anchor-relative x")
         ax.set_ylabel("Anchor-relative y")
 

@@ -1,293 +1,9 @@
-import math
-from typing import List
-
-import einops
-import networkx as nx
 import numpy as np
 import torch
 import torch_geometric as pyg
 import torch_geometric.data as pyg_data
-import torchvision.transforms as transforms
-from scipy.sparse.linalg import eigsh
-from torch import Tensor
-from torch_geometric.utils import get_laplacian, to_scipy_sparse_matrix
-from torchvision.transforms import InterpolationMode
-from torchvision.transforms import functional as F
 from pathlib import Path
 import tifffile as tiff
-
-# import albumentations
-# import cv2
-
-
-def generate_random_expander(num_nodes, degree, rng=None, max_num_iters=5, exp_index=0):
-    """Generates a random d-regular expander graph with n nodes.
-    Returns the list of edges. This list is symmetric; i.e., if
-    (x, y) is an edge so is (y,x).
-    Args:
-      num_nodes: Number of nodes in the desired graph.
-      degree: Desired degree.
-      rng: random number generator
-      max_num_iters: maximum number of iterations
-    Returns:
-      senders: tail of each edge.
-      receivers: head of each edge.
-    """
-    if isinstance(degree, str):
-        degree = round((int(degree[:-1]) * (num_nodes - 1)) / 100)
-    num_nodes = num_nodes
-
-    if rng is None:
-        rng = np.random.default_rng()
-    eig_val = -1
-    eig_val_lower_bound = (
-        max(0, degree - 2 * math.sqrt(degree - 1) - 0.1) if degree > 0 else 0
-    )  # allow the use of zero degree
-
-    max_eig_val_so_far = -1
-    max_senders = []
-    max_receivers = []
-    cur_iter = 1
-
-    # (bave): This is a hack.  This should hopefully fix the bug
-    if num_nodes <= degree:
-        degree = num_nodes - 1
-
-    # (ali): if there are too few nodes, random graph generation will fail. in this case, we will
-    # add the whole graph.
-    if num_nodes <= 10:
-        for i in range(num_nodes):
-            for j in range(num_nodes):
-                if i != j:
-                    max_senders.append(i)
-                    max_receivers.append(j)
-    else:
-        while eig_val < eig_val_lower_bound and cur_iter <= max_num_iters:
-            senders, receivers = generate_random_regular_graph(num_nodes, degree, rng)
-
-            eig_val = get_eigenvalue(senders, receivers, num_nodes=num_nodes)
-            if len(eig_val) == 0:
-                print(
-                    "num_nodes = %d, degree = %d, cur_iter = %d, mmax_iters = %d, senders = %d, receivers = %d"
-                    % (
-                        num_nodes,
-                        degree,
-                        cur_iter,
-                        max_num_iters,
-                        len(senders),
-                        len(receivers),
-                    )
-                )
-                eig_val = 0
-            else:
-                eig_val = eig_val[0]
-            if eig_val > max_eig_val_so_far:
-                max_eig_val_so_far = eig_val
-                max_senders = senders
-                max_receivers = receivers
-
-            cur_iter += 1
-    max_senders = torch.tensor(max_senders, dtype=torch.long).view(-1, 1)
-    max_receivers = torch.tensor(max_receivers, dtype=torch.long).view(-1, 1)
-    expander_edges = torch.cat([max_senders, max_receivers], dim=1)
-    return expander_edges
-
-
-def get_eigenvalue(senders, receivers, num_nodes):
-    edge_index = torch.tensor(np.stack([senders, receivers]))
-    edge_index, edge_weight = get_laplacian(
-        edge_index, None, normalization=None, num_nodes=num_nodes
-    )
-    L = to_scipy_sparse_matrix(edge_index, edge_weight, num_nodes)
-    return eigsh(L, k=2, which="SM", return_eigenvectors=False)
-
-
-def generate_random_regular_graph(num_nodes, degree, rng=None):
-    """Generates a random d-regular connected graph with n nodes.
-    Returns the list of edges. This list is symmetric; i.e., if
-    (x, y) is an edge so is (y,x).
-    Args:
-      num_nodes: Number of nodes in the desired graph.
-      degree: Desired degree.
-      rng: random number generator
-    Returns:
-      senders: tail of each edge.
-      receivers: head of each edge.
-    """
-    if (num_nodes * degree) % 2 != 0:
-        raise TypeError("nodes * degree must be even")
-    if rng is None:
-        rng = np.random.default_rng()
-    if degree == 0:
-        return np.array([]), np.array([])
-    nodes = rng.permutation(np.arange(num_nodes))
-    num_reps = degree // 2
-    num_nodes = len(nodes)
-
-    ns = np.hstack([np.roll(nodes, i + 1) for i in range(num_reps)])
-    edge_index = np.vstack((np.tile(nodes, num_reps), ns))
-
-    if degree % 2 == 0:
-        senders, receivers = np.concatenate(
-            [edge_index[0], edge_index[1]]
-        ), np.concatenate([edge_index[1], edge_index[0]])
-        return senders, receivers
-    else:
-        edge_index = np.hstack(
-            (edge_index, np.vstack((nodes[: num_nodes // 2], nodes[num_nodes // 2 :])))
-        )
-        senders, receivers = np.concatenate(
-            [edge_index[0], edge_index[1]]
-        ), np.concatenate([edge_index[1], edge_index[0]])
-        return senders, receivers
-
-
-class RandomCropAndResizedToOriginal(transforms.RandomResizedCrop):
-    def forward(self, img):
-        size = img.size
-        i, j, h, w = self.get_params(img, self.scale, self.ratio)
-        return F.resized_crop(img, i, j, h, w, size, self.interpolation)
-
-
-def _get_augmentation(augmentation_type: str = "none"):
-    switch = {
-        "weak": [transforms.RandomHorizontalFlip(p=0.5)],
-        "hard": [
-            transforms.RandomHorizontalFlip(p=0.5),
-            RandomCropAndResizedToOriginal(
-                size=(1, 1), scale=(0.8, 1), interpolation=InterpolationMode.BICUBIC
-            ),
-        ],
-    }
-    return switch.get(augmentation_type, [])
-
-
-@torch.jit.script
-def divide_images_into_patches(
-    img, patch_per_dim: List[int], patch_size: int
-) -> List[Tensor]:
-    # img2 = einops.rearrange(img, "c h w -> h w c")
-
-    # divide images in non-overlapping patches based on patch size
-    # output dim -> a
-    img2 = img.permute(1, 2, 0)
-    patches = img2.unfold(0, patch_size, patch_size).unfold(1, patch_size, patch_size)
-    y = torch.linspace(-1, 1, patch_per_dim[0])
-    x = torch.linspace(-1, 1, patch_per_dim[1])
-    xy = torch.stack(torch.meshgrid(x, y, indexing="xy"), -1)
-    # print(patch_per_dim)
-
-    return xy, patches
-
-
-# generation of a unique graph for each number of nodes
-def create_graph(patch_per_dim, degree, unique_graph):
-    # Create an empty dictionary
-    patch_edge_index_dict = {}
-    for patch_dim in patch_per_dim:
-        if degree == -1:
-            num_patches = patch_dim[0] * patch_dim[1]
-            adj_mat = torch.ones(num_patches, num_patches)
-            edge_index, _ = adj_mat.nonzero().t().contiguous()
-        else:
-            num_patches = patch_dim[0] * patch_dim[1]
-            edge_index = (
-                generate_random_expander(
-                    num_nodes=num_patches, degree=degree, rng=unique_graph
-                )
-                .t()
-                .contiguous()
-            )
-        patch_edge_index_dict[patch_dim] = edge_index
-    return patch_edge_index_dict
-
-
-class Puzzle_Dataset(pyg_data.Dataset):
-    def __init__(
-        self,
-        dataset=None,
-        dataset_get_fn=None,
-        patch_per_dim=[(7, 6)],
-        patch_size=32,
-        augment="",
-        degree=-1,
-        unique_graph=None,
-        random=False,
-    ) -> None:
-        super().__init__()
-
-        assert dataset is not None and dataset_get_fn is not None
-        self.dataset = dataset
-        self.dataset_get_fn = dataset_get_fn
-        self.patch_per_dim = patch_per_dim
-        self.unique_graph = unique_graph
-        self.augment = augment
-        self.random = random
-
-        self.transforms = transforms.Compose(
-            [
-                *_get_augmentation(augment),
-                transforms.ToTensor(),
-            ]
-        )
-        self.patch_size = patch_size
-        self.degree = degree
-
-        if self.unique_graph is not None:
-            self.edge_index = create_graph(
-                self.patch_per_dim, self.degree, self.unique_graph
-            )
-
-    def len(self) -> int:
-        if self.dataset is not None:
-            return len(self.dataset)
-        else:
-            raise Exception("Dataset not provided")
-
-    def get(self, idx):
-        if self.dataset is not None:
-            img = self.dataset_get_fn(self.dataset[idx])
-
-        rdim = torch.randint(len(self.patch_per_dim), size=(1,)).item()
-        patch_per_dim = self.patch_per_dim[rdim]
-
-        height = patch_per_dim[0] * self.patch_size
-        width = patch_per_dim[1] * self.patch_size
-        img = img.resize((width, height))#, resample=Resampling.BICUBIC)
-        img = self.transforms(img)
-
-        xy, patches = divide_images_into_patches(img, patch_per_dim, self.patch_size)
-
-        xy = einops.rearrange(xy, "x y c -> (x y) c")
-
-        indexes = torch.arange(patch_per_dim[0] * patch_per_dim[1]).reshape(
-            xy.shape[:-1]
-        )
-        patches = einops.rearrange(patches, "x y c k1 k2 -> (x y) c k1 k2")
-        if self.random:
-            patches = patches[torch.randperm(len(patches))]
-        if self.degree == -1:
-            adj_mat = torch.ones(
-                patch_per_dim[0] * patch_per_dim[1], patch_per_dim[0] * patch_per_dim[1]
-            )
-
-            edge_index, _ = pyg.utils.dense_to_sparse(adj_mat)
-        else:
-            if not self.unique_graph:
-                edge_index = generate_random_expander(
-                    patch_per_dim[0] * patch_per_dim[1], self.degree
-                ).T
-        data = pyg_data.Data(
-            x=xy,
-            indexes=indexes,
-            patches=patches,
-            edge_index=self.edge_index[patch_per_dim]
-            if self.unique_graph
-            else edge_index,
-            ind_name=torch.tensor([idx]).long(),
-            patches_dim=torch.tensor([patch_per_dim]),
-        )
-        return data
 
 
 class OCTPuzzleDataset(pyg_data.Dataset):
@@ -300,6 +16,9 @@ class OCTPuzzleDataset(pyg_data.Dataset):
         max_num_batches=8,
         min_batch_size=3,
         max_batch_size=3,
+        min_total_nodes=20,
+        max_total_nodes=20,
+        min_unique_scans=10,
         crop_l=220,
         valid_scan_start=50,
         valid_scan_end=200,
@@ -308,8 +27,7 @@ class OCTPuzzleDataset(pyg_data.Dataset):
         margin_x_right=260,
         min_mask_pixels=500,
         display_height=0.55,
-        scan_spacing=0.10,
-        degree=-1,
+        scan_spacing=0.05,
         seed=42,
         randomize_samples=False,
         samples_per_volume=1,
@@ -325,14 +43,16 @@ class OCTPuzzleDataset(pyg_data.Dataset):
         self.min_batch_size = min_batch_size
         self.max_batch_size = max_batch_size
         self.crop_l = crop_l
-
+        self.min_total_nodes = min_total_nodes
+        self.max_total_nodes = max_total_nodes
+        self.min_unique_scans = min_unique_scans
+        # self.max_batch_overlap = max_batch_overlap
         self.valid_scan_start = valid_scan_start
         self.valid_scan_end = valid_scan_end
         self.margin_y = margin_y
         self.margin_x_left = margin_x_left
         self.margin_x_right = margin_x_right
         self.min_mask_pixels = min_mask_pixels
-        
         self.randomize_samples = randomize_samples
         self.samples_per_volume = int(samples_per_volume)
         
@@ -349,7 +69,6 @@ class OCTPuzzleDataset(pyg_data.Dataset):
 
         self.display_height = display_height
         self.scan_spacing = scan_spacing
-        self.degree = degree
         if seed is None:
             self.seed = np.random.SeedSequence().generate_state(1)[0].item()
         else:
@@ -533,8 +252,23 @@ class OCTPuzzleDataset(pyg_data.Dataset):
         return dense_indices[start:start + batch_size]
 
     def sample_batches(self, rng, dense_indices):
-        num_batches = rng.integers(self.min_num_batches, self.max_num_batches + 1)
-        return [self.sample_one_batch(rng, dense_indices) for _ in range(num_batches)]
+        max_attempts = 100
+        for _ in range(max_attempts):
+            num_batches = rng.integers(self.min_num_batches, self.max_num_batches + 1)
+            batches = [self.sample_one_batch(rng, dense_indices) for _ in range(num_batches)]
+            
+            total_nodes = sum(len(batch) for batch in batches)
+            unique_scans = len(set(scan_idx for batch in batches for scan_idx in batch))
+            # valid_overlap = all(
+            #     len(set(batches[i]) & set(batches[j]))
+            #     / min(len(set(batches[i])), len(set(batches[j]))) <= self.max_batch_overlap
+            #     for i in range(len(batches))
+            #     for j in range(i + 1, len(batches))
+            # )
+
+            if total_nodes >= self.min_total_nodes and total_nodes <= self.max_total_nodes and unique_scans >= self.min_unique_scans:
+                return batches
+        raise RuntimeError(f"Could not sample a puzzle with at least {self.min_total_nodes} nodes, at most {self.max_total_nodes} nodes, and {self.min_unique_scans} unique scans.")
 
     def sample_crop_cols(self, rng, W):
         center = rng.integers(self.crop_l // 2, W - self.crop_l // 2 + 1)
@@ -601,6 +335,49 @@ class OCTPuzzleDataset(pyg_data.Dataset):
         rough_radius[anchor_idx] = 0.0
 
         return rough_delta, rough_radius
+    
+    def make_rough_neighborhood_graph(self, rough_delta, rough_radius, anchor_idx, min_neighbors=3):
+        num_nodes = rough_delta.shape[0]
+        edges = set()
+
+        for i in range(num_nodes):
+            if i == anchor_idx:
+                continue
+
+            dx = torch.abs(rough_delta[:, 0] - rough_delta[i, 0])
+            dy = torch.abs(rough_delta[:, 1] - rough_delta[i, 1])
+
+            x_limit = rough_radius[:, 0] + rough_radius[i, 0]
+            y_limit = rough_radius[:, 1] + rough_radius[i, 1]
+
+            valid = (dx <= x_limit) & (dy <= y_limit)
+            valid[i] = False
+            valid[anchor_idx] = False
+
+            neighbors = torch.where(valid)[0]
+
+            # if neighbors.numel() < min_neighbors:
+            #     distance = torch.sqrt((dx / (x_limit + 1e-8)) ** 2 + (dy / (y_limit + 1e-8)) ** 2)
+
+            #     distance[i] = float("inf")
+            #     distance[anchor_idx] = float("inf")
+
+            #     nearest = torch.argsort(distance)[:min_neighbors]
+            #     neighbors = torch.unique(torch.cat([neighbors, nearest]))
+
+            for j in neighbors.tolist():
+                edges.add((i, j))
+                edges.add((j, i))
+
+        # Source anchor sends to every prediction node
+        for j in range(num_nodes):
+            if j != anchor_idx:
+                edges.add((anchor_idx, j))
+
+        # Anchor retains its own representation.
+        # edges.add((anchor_idx, anchor_idx))
+
+        return torch.tensor(sorted(edges), dtype=torch.long).t().contiguous()
 
     def get(self, idx):
         volume_idx = idx // self.samples_per_volume
@@ -669,6 +446,7 @@ class OCTPuzzleDataset(pyg_data.Dataset):
 
         valid_batch_id = 0
 
+        # shared_c0, shared_c1 = self.sample_crop_cols(rng, stack.shape[2])
         for batch_indices in batches:
             c0, c1 = self.sample_crop_cols(rng, stack.shape[2])
 
@@ -691,14 +469,16 @@ class OCTPuzzleDataset(pyg_data.Dataset):
                 full_col = c0 + local_col
 
                 gx, gy = self.pixel_to_display_xy(row, full_col, y_scan, full_shape)
+                # gx = self.col_to_full_x((c0 + c1 - 1) / 2.0, full_shape)
+                # gy = float(y_scan)
                 
                 # row_offset_y = (0.5 - (row / (full_shape[0] - 1))) * self.display_height
-                row_offset_y = self.row_to_y_offset(row, full_shape)
-                col_offset_x = self.col_to_full_x(full_col, full_shape)
+                # row_offset_y = self.row_to_y_offset(row, full_shape)
+                # col_offset_x = self.col_to_full_x(full_col, full_shape)
                 
-                if idx == 0:
-                    print(f"scan {scan_idx}: "f"row={row:.1f}, "f"full_col={full_col:.1f}, "f"x={gx:.6f}, "f"scan_y={float(y_scan):.6f}, "f"row_offset_y={row_offset_y:.6f}, "f"final_y={gy:.6f}")
-                    print(f"x={col_offset_x:.4f}, "f"y_scan={y_scan:.4f}, "f"row_offset={row_offset_y:.4f}, "f"y={gy:.4f}")
+                # if idx == 0:
+                #     print(f"scan {scan_idx}: "f"row={row:.1f}, "f"full_col={full_col:.1f}, "f"x={gx:.6f}, "f"scan_y={float(y_scan):.6f}, "f"row_offset_y={row_offset_y:.6f}, "f"final_y={gy:.6f}")
+                #     print(f"x={col_offset_x:.4f}, "f"y_scan={y_scan:.4f}, "f"row_offset={row_offset_y:.4f}, "f"y={gy:.4f}")
 
                 current_patches.append(self.crop_to_patch_tensor(img_crop))
                 current_xy.append([gx, gy])
@@ -726,10 +506,9 @@ class OCTPuzzleDataset(pyg_data.Dataset):
         raw_xy = torch.tensor(node_raw_xy, dtype=torch.float32)
 
         num_nodes = raw_xy.shape[0]
-        edge_index = self.make_complete_graph(num_nodes)
 
-        # anchor_idx = int(rng.integers(0, num_nodes))
-        anchor_idx = num_nodes // 2
+        anchor_idx = int(rng.integers(0, num_nodes))
+        # anchor_idx = num_nodes // 2
         anchor_xy = raw_xy[anchor_idx].clone()
 
         gt_delta = raw_xy - anchor_xy
@@ -739,18 +518,37 @@ class OCTPuzzleDataset(pyg_data.Dataset):
         y_scale = (self.dense_size - 1) * self.scan_spacing + self.display_height
 
         delta_scale = torch.tensor([x_scale, y_scale], dtype=torch.float32)
-        gt_delta_model = gt_delta / delta_scale
-
         # coordinates used by the model/diffusion process
         gt_delta_model = gt_delta / delta_scale
         gt_delta_model[anchor_idx] = 0.0
         
         # rough GPS-like conditioning metadata
         rough_delta, rough_radius = self.create_rough_relative_locations(gt_delta=gt_delta, anchor_idx=anchor_idx, rng=rng)
+        
+        edge_index = self.make_rough_neighborhood_graph(rough_delta, rough_radius, anchor_idx)
 
         # normalize rough coordinates using the same scale as the target
         rough_delta_model = rough_delta / delta_scale
         rough_delta_model[anchor_idx] = 0.0
+        
+        src = edge_index[0]
+        dst = edge_index[1]
+        
+        # Directed displacement from source node to destination node.
+        edge_attr = rough_delta_model[dst] - rough_delta_model[src]
+        
+        # Residual correction in physical coordinates.
+        correction = gt_delta - rough_delta
+        correction[anchor_idx] = 0.0
+
+        # Normalize the residual by the uncertainty radius on each axis.
+        # This makes X and Y targets comparable:
+        #   correction_x / 0.04
+        #   correction_y / 0.20
+        correction_scale = torch.tensor([self.rough_radius_x, self.rough_radius_y], dtype=torch.float32)
+        
+        correction_model = correction / correction_scale
+        correction_model[anchor_idx] = 0.0
 
         # rough_radius has shape [num_nodes, 2]:
         #   [:, 0] = raw X uncertainty radius
@@ -761,28 +559,29 @@ class OCTPuzzleDataset(pyg_data.Dataset):
         rough_radius_model = rough_radius / delta_scale.unsqueeze(0)
         rough_radius_model[anchor_idx] = 0.0
         
-        if idx == 0:
-            print("gt_delta x range:", gt_delta[:, 0].min().item(), gt_delta[:, 0].max().item())
-            print("gt_delta y range:", gt_delta[:, 1].min().item(), gt_delta[:, 1].max().item())
-            print("normalized x range:", gt_delta_model[:, 0].min().item(), gt_delta_model[:, 0].max().item())
-            print("normalized y range:", gt_delta_model[:, 1].min().item(), gt_delta_model[:, 1].max().item())
+        # if idx == 0:
+        #     print("gt_delta x range:", gt_delta[:, 0].min().item(), gt_delta[:, 0].max().item())
+        #     print("gt_delta y range:", gt_delta[:, 1].min().item(), gt_delta[:, 1].max().item())
+        #     print("normalized x range:", gt_delta_model[:, 0].min().item(), gt_delta_model[:, 0].max().item())
+        #     print("normalized y range:", gt_delta_model[:, 1].min().item(), gt_delta_model[:, 1].max().item())
 
-            print("delta scale:", delta_scale.tolist())
+        #     print("delta scale:", delta_scale.tolist())
         
 
-            for node_idx in range(num_nodes):
-                error = torch.linalg.vector_norm(rough_delta[node_idx] - gt_delta[node_idx]).item()
-                print(f"node {node_idx}: "f"gt={gt_delta[node_idx].tolist()}, "f"rough={rough_delta[node_idx].tolist()}, "f"error={error:.4f}, "f"radius_x={rough_radius[node_idx, 0].item():.4f}, "f"radius_y={rough_radius[node_idx, 1].item():.4f}")
+        #     for node_idx in range(num_nodes):
+        #         error = torch.linalg.vector_norm(rough_delta[node_idx] - gt_delta[node_idx]).item()
+        #         print(f"node {node_idx}: "f"gt={gt_delta[node_idx].tolist()}, "f"rough={rough_delta[node_idx].tolist()}, "f"error={error:.4f}, "f"radius_x={rough_radius[node_idx, 0].item():.4f}, "f"radius_y={rough_radius[node_idx, 1].item():.4f}")
 
         is_anchor = torch.zeros(num_nodes, 1, dtype=torch.float32)
         is_anchor[anchor_idx, 0] = 1.0
 
         data = pyg_data.Data(
             # Diffusion model target: approximately [-1, 1] on both axes
-            x=gt_delta_model,
+            x=correction_model,
     
             patches=patches,
             edge_index=edge_index,
+            edge_attr=edge_attr,
             ind_name=torch.tensor([volume_idx]).long(),
             sample_idx=torch.tensor([sample_idx]).long(),
             sample_seed=torch.tensor([sample_seed]).long(),
@@ -807,6 +606,10 @@ class OCTPuzzleDataset(pyg_data.Dataset):
             # Rough GPS-like conditioning in model coordinates
             rough_delta_model=rough_delta_model,
             rough_radius_model=rough_radius_model,
+            
+            correction=correction,
+            correction_model=correction_model,
+            correction_scale=correction_scale.unsqueeze(0),
     
             anchor_idx=torch.tensor([anchor_idx]).long(),
             anchor_xy=anchor_xy[None, :],

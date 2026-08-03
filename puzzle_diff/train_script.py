@@ -20,34 +20,34 @@ from dataset import dataset_utils as du
 from model import spatial_diffusion as sd
 
 
-def get_random_string(length):
-    # choose from all lowercase letter
-    letters = string.ascii_lowercase
-    result_str = "".join(random.choice(letters) for i in range(length))
-    return result_str  # print("Random string of length", length, "is:", result_str)
+# def get_random_string(length):
+#     # choose from all lowercase letter
+#     letters = string.ascii_lowercase
+#     result_str = "".join(random.choice(letters) for i in range(length))
+#     return result_str  # print("Random string of length", length, "is:", result_str)
 
 
-class Percent(object):
-    def __new__(self, percent_string):
-        if percent_string.endswith("%"):
-            return str(percent_string)
-        else:
-            return int(percent_string)
+# class Percent(object):
+#     def __new__(self, percent_string):
+#         if percent_string.endswith("%"):
+#             return str(percent_string)
+#         else:
+#             return int(percent_string)
 
 
 def main(**cfg):
-    train_dt, test_dt = du.get_dataset(cfg)
+    train_dt, val_dt, _ = du.get_dataset(cfg)
 
     dl_train = torch_geometric.loader.DataLoader(
         train_dt,
         batch_size=cfg["batch_size"],
         num_workers=cfg["num_workers"],
         shuffle=False,
-        persistent_workers=False,
+        persistent_workers=True,
     )
 
-    dl_test = torch_geometric.loader.DataLoader(
-        test_dt,
+    dl_val = torch_geometric.loader.DataLoader(
+        val_dt,
         batch_size=cfg["batch_size"],
         num_workers=cfg["num_workers"],
         shuffle=False,
@@ -60,6 +60,8 @@ def main(**cfg):
         dense_vis_epochs=cfg.get("dense_vis_epochs", 0),
         backbone_learning_rate=float(cfg["backbone_learning_rate"]),
         head_learning_rate=float(cfg["head_learning_rate"]),
+        backbone_weight_decay=float(cfg.get("backbone_weight_decay", 0.0)),
+        head_weight_decay=float(cfg.get("head_weight_decay", 1e-4)),
         inference_ratio=cfg["inference_ratio"],
         classifier_free_w=cfg["classifier_free_w"],
         classifier_free_prob=cfg["classifier_free_prob"],
@@ -68,12 +70,10 @@ def main(**cfg):
         model_mean_type=sd.ModelMeanType.START_X
         if cfg["predict_xstart"]
         else sd.ModelMeanType.EPSILON,
-        rough_condition_dropout=cfg.get("rough_condition_dropout", 0.25),
         visual_pretrained=cfg["visual_pretrained"],
         freeze_backbone=cfg["freeze_backbone"],
         backbone=cfg["backbone"],
         architecture=cfg["architecture"],
-        virt_nodes=cfg["virt_nodes"],
         all_equivariant=False,
     )
 
@@ -106,9 +106,10 @@ def main(**cfg):
         max_steps=cfg.get("max_steps", -1),
         # Validate every N training batches.
         val_check_interval=cfg.get("val_check_interval", 1000),
+        # limit_val_batches=cfg.get("limit_val_batches", 1.0),
     )
 
-    trainer.fit(model, dl_train, dl_test, ckpt_path=cfg["checkpoint_path"])
+    trainer.fit(model, dl_train, dl_val, ckpt_path=cfg["checkpoint_path"])
 
 
 if __name__ == "__main__":

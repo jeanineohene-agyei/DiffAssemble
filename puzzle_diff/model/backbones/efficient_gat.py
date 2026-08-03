@@ -41,7 +41,7 @@ class Eff_GAT(nn.Module):
             "resnet18": 3136,
             "resnet50": 12352,
             # visual + noisy xy + time + anchor + rough location
-            "efficientnet_b0": 2432 + 32 + 32 + 16 + 32,
+            "efficientnet_b0": 6144 + 32 + 32 + 16 + 32,
             #97792 + 32 + 32 resnet50
         }[model]
 
@@ -56,6 +56,7 @@ class Eff_GAT(nn.Module):
                 hidden_dim=32 * 8,
                 heads=8,
                 output_size=self.combined_features_dim,
+                edge_dim=2,
             )
         elif architecture == "exophormer":
             self.gnn_backbone = Exophormer_GNN(
@@ -74,8 +75,8 @@ class Eff_GAT(nn.Module):
         )
         
         self.rough_location_mlp = nn.Sequential(
-            # rough_delta_x, rough_delta_y, radius_x, radius_y, rough_valid
-            nn.Linear(5, 16),
+            # rough_delta_x, rough_delta_y, radius_x, radius_y
+            nn.Linear(4, 16),
             nn.GELU(),
             nn.Linear(16, 32),
         )
@@ -84,7 +85,11 @@ class Eff_GAT(nn.Module):
             nn.Linear(self.combined_features_dim, 32),
             nn.GELU(),
             nn.Linear(32, output_channels),
+            nn.Tanh(),
         )
+        nn.init.zeros_(self.final_mlp[-2].weight)
+        nn.init.zeros_(self.final_mlp[-2].bias)
+        
         self.time_emb = nn.Embedding(steps, 32)
         self.pos_mlp = nn.Sequential(
             nn.Linear(input_channels, 16), nn.GELU(), nn.Linear(16, 32)
@@ -106,10 +111,10 @@ class Eff_GAT(nn.Module):
         self.register_buffer("mean", mean)
         self.register_buffer("std", std)
 
-    def forward(self, xy_pos, time, patch_rgb, edge_index, batch, is_anchor, rough_delta, rough_radius, rough_valid):
+    def forward(self, xy_pos, time, patch_rgb, edge_index, edge_attr, batch, is_anchor, rough_delta, rough_radius):
         patch_feats = self.visual_features(patch_rgb)
         final_feats = self.forward_with_feats(
-            xy_pos, time, edge_index, patch_feats=patch_feats, batch=batch, is_anchor=is_anchor, rough_delta=rough_delta, rough_radius=rough_radius, rough_valid=rough_valid
+            xy_pos, time, edge_index, edge_attr, patch_feats=patch_feats, batch=batch, is_anchor=is_anchor, rough_delta=rough_delta, rough_radius=rough_radius
         )
         return final_feats
 
@@ -118,17 +123,17 @@ class Eff_GAT(nn.Module):
         xy_pos: Tensor,
         time: Tensor,
         edge_index: Tensor,
+        edge_attr: Tensor,
         patch_feats: Tensor,
         batch,
         is_anchor,
         rough_delta: Tensor,
         rough_radius: Tensor,
-        rough_valid: Tensor
     ):
 
         time_feats = self.time_emb(time)  # embedding, int -> 32
         pos_feats = self.pos_mlp(xy_pos)  # MLP, (x, y) -> 32
-        rough_input = torch.cat([rough_delta.float(), rough_radius.float(), rough_valid.float()], dim=-1)
+        rough_input = torch.cat([rough_delta.float(), rough_radius.float()], dim=-1)
         rough_feats = self.rough_location_mlp(rough_input)
         anchor_feats = self.anchor_mlp(is_anchor.float())
         # COMBINE  and transform with MLP
@@ -137,7 +142,7 @@ class Eff_GAT(nn.Module):
 
         # GNN
         feats, attentions = self.gnn_backbone(
-            x=combined_feats, edge_index=edge_index, batch=batch
+            x=combined_feats, edge_index=edge_index, edge_attr=edge_attr, batch=batch
         )
 
 
@@ -166,8 +171,8 @@ class Eff_GAT(nn.Module):
             #     feats[3].reshape(patch_rgb.shape[0], -1),
             # ],
             "efficientnet_b0": [
-                F.adaptive_avg_pool2d(feats[2], (8, 2)).flatten(1),
-                F.adaptive_avg_pool2d(feats[3], (8, 2)).flatten(1)
+                F.adaptive_avg_pool2d(feats[2], (16, 4)).flatten(1),
+                F.adaptive_avg_pool2d(feats[3], (8, 4)).flatten(1)
             ],
             "resnet50": [
                 feats[2].reshape(patch_rgb.shape[0], -1),

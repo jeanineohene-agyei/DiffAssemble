@@ -1,7 +1,7 @@
-experiment_name: 8_test_coord_updates
+experiment_name: 19_small_size_graph_norm
 
-batch_size: 1
-acc_grad: 4
+batch_size: 2
+acc_grad: 2
 gpus: 2
 steps: 1000
 num_workers: 8
@@ -9,18 +9,25 @@ num_workers: 8
 max_epochs: 10000
 max_steps: 200000
 
-val_check_interval: 500
+val_check_interval: 700
+# limit_val_batches: 0.0
 
-include_dense_vis: true
-dense_vis_epochs: 1
+include_dense_vis: false
+dense_vis_epochs: 0
 
 dataset: oct
 oct_root: /data/jeanine/processed_data
 
+train_fraction: 0.7
+val_fraction: 0.2
+test_fraction: 0.1
+
 # train_num_volumes: 1
+val_samples_per_volume: 3
+test_samples_per_volume: 1
+
 samples_per_volume: 5
 randomize_samples: true
-rough_condition_dropout: 0.25
 
 sampling: DDIM
 inference_ratio: 20
@@ -30,6 +37,8 @@ wandb_id: null
 
 backbone_learning_rate: 1e-5
 head_learning_rate: 1e-4
+backbone_weight_decay: 0.0
+head_weight_decay: 1e-4
 
 classifier_free_w: 0.0
 classifier_free_prob: 0.0
@@ -48,15 +57,16 @@ backbone: efficientnet_b0
 architecture: transformer
 all_equivariant: false
 
-degree: -1
-virt_nodes: 4
-inf_fully: false
 save_eval_images: true
 
-dense_size: 10
-crop_l: 200
+dense_size: 30
+crop_l: 180
 
-min_num_batches: 3
-max_num_batches: 5
-min_batch_size: 3
+min_total_nodes: 16
+max_total_nodes: 24
+min_unique_scans: 6
+
+min_num_batches: 4
+max_num_batches: 4
+min_batch_size: 4
 max_batch_size: 6
