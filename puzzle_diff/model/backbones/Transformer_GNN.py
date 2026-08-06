@@ -24,7 +24,7 @@ class Transformer_GNN(nn.Module):
                 ),
             ]
         )
-        self.norms = nn.ModuleList([GraphNorm(hidden_dim) for _ in range(n_layers - 1)])
+        self.norms = nn.ModuleList([GraphNorm(hidden_dim) for _ in range(n_layers - 1)])  # graph normalization
 
         self.n_layers = n_layers
 
@@ -34,7 +34,7 @@ class Transformer_GNN(nn.Module):
             x, atts = self.module_list[i](
                 x=x, edge_index=edge_index, edge_attr=edge_attr, return_attention_weights=True
             )
-            x = self.norms[i](x)
+            x = self.norms[i](x)  # graph normalization
             x = nn.functional.gelu(x)
             attentions.append(atts)
 

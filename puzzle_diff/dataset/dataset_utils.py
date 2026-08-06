@@ -18,7 +18,7 @@ def get_participant_id(path: Path) -> str:
 
 
 def get_volume_key(path: Path) -> str:
-    """Return the filename prefix shared by the B-scan and segmentation files."""
+    """return the filename prefix (participant id) shared by the B-scan and segmentation files"""
     suffix = "_bscans.tif"
 
     if not path.name.endswith(suffix):
@@ -40,7 +40,7 @@ def get_dataset(cfg):
         raise RuntimeError(f"No OCT segmentation files found under {root}")
 
     # Pair B-scans and segmentations using their full volume path rather than
-    # assuming two independently sorted lists are aligned.
+    # assuming two independently sorted lists are aligned
     seg_lookup = {}
 
     for seg_path in seg_paths:
@@ -51,7 +51,7 @@ def get_dataset(cfg):
 
         volume_name = seg_path.name.removesuffix(seg_suffix)
 
-        # Include batch and participant so identical volume names cannot collide.
+        # include batch and participant so identical volume names cannot collide
         key = (seg_path.parent.parent.name, seg_path.parent.name, volume_name)
 
         seg_lookup[key] = seg_path
@@ -71,7 +71,7 @@ def get_dataset(cfg):
         participant_id = get_participant_id(bscan_path)
         paired_volumes.append({"participant_id": participant_id, "bscan_path": bscan_path, "seg_path": seg_path})
 
-    # Group all volumes belonging to the same participant.
+    # group all volumes belonging to the same participant
     participant_to_volumes = defaultdict(list)
 
     for volume in paired_volumes:
@@ -82,7 +82,7 @@ def get_dataset(cfg):
     if len(participant_ids) < 2:
         raise RuntimeError("A participant-level train/validation split requires at least " f"2 participants, but found {len(participant_ids)}.")
 
-    # Shuffle participants deterministically before splitting.
+    # shuffle participants deterministically before splitting
     split_seed = cfg.get("split_seed", 42)
     split_rng = random.Random(split_seed)
     split_rng.shuffle(participant_ids)
@@ -105,11 +105,11 @@ def get_dataset(cfg):
     num_train = int(train_fraction * num_participants)
     num_val = int(val_fraction * num_participants)
 
-    # Ensure each split contains at least one participant
+    # ensure each split contains at least one participant
     num_train = max(1, num_train)
     num_val = max(1, num_val)
 
-    # Leave at least one participant for test.
+    # leave at least one participant for test
     if num_train + num_val >= num_participants:
         num_train = num_participants - 2
         num_val = 1
@@ -131,7 +131,7 @@ def get_dataset(cfg):
     val_volumes = [volume for participant_id in val_participant_ids for volume in participant_to_volumes[participant_id]]
     test_volumes = [volume for participant_id in test_participant_ids for volume in participant_to_volumes[participant_id]]
 
-    # Optional debugging subset. Only limit training data.
+    # debugging subset
     n = cfg.get("train_num_volumes")
 
     if n is not None:
@@ -146,7 +146,7 @@ def get_dataset(cfg):
     test_bscan_paths = [v["bscan_path"] for v in test_volumes]
     test_seg_paths = [v["seg_path"] for v in test_volumes]
 
-    # Verify no participant leakage
+    # verify no participant leakage
     assert train_participants.isdisjoint(val_participants)
     assert train_participants.isdisjoint(test_participants)
     assert val_participants.isdisjoint(test_participants)
@@ -157,7 +157,7 @@ def get_dataset(cfg):
     print(f"Training: {len(train_participants)} participants, "f"{len(train_bscan_paths)} volumes")
     print(f"Validation: {len(val_participants)} participants, "f"{len(val_bscan_paths)} volumes")
     print(f"Testing: {len(test_participants)} participants, "f"{len(test_bscan_paths)} volumes")
-    print("Participant overlap: ""train/val={train_participants & val_participants}, "f"train/test={train_participants & test_participants}, "f"val/test={val_participants & test_participants}")
+    print("Participant overlap: "f"train/val={train_participants & val_participants}, "f"train/test={train_participants & test_participants}, "f"val/test={val_participants & test_participants}")
 
     common_dataset_args = {
         "dense_size": cfg["dense_size"],
@@ -169,7 +169,6 @@ def get_dataset(cfg):
         "min_unique_scans": cfg["min_unique_scans"],
         "min_total_nodes": cfg["min_total_nodes"],
         "max_total_nodes": cfg["max_total_nodes"],
-        # "max_batch_overlap": cfg["max_batch_overlap"],
     }
 
     train_dt = OCTPuzzleDataset(

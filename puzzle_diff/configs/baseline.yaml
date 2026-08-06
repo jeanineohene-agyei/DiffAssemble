@@ -1,4 +1,4 @@
-experiment_name: 19_small_size_graph_norm
+experiment_name: 22_update_loss_16_24_node_4_6_batch_3_4_batch_size
 
 batch_size: 2
 acc_grad: 2
@@ -62,11 +62,11 @@ save_eval_images: true
 dense_size: 30
 crop_l: 180
 
-min_total_nodes: 16
-max_total_nodes: 24
-min_unique_scans: 6
+min_total_nodes: 12
+max_total_nodes: 12
+min_unique_scans: 8
 
 min_num_batches: 4
 max_num_batches: 4
-min_batch_size: 4
-max_batch_size: 6
+min_batch_size: 3
+max_batch_size: 3

@@ -2,12 +2,10 @@ import timm
 import torch
 import torch.nn as nn
 from torch import Tensor
-from torch_geometric.nn import GraphNorm
 from torch.nn import functional as F
 
 from .exophormer_gnn import Exophormer_GNN
 from .Transformer_GNN import Transformer_GNN
-from torchvision.transforms.functional import rotate
 
 
 class Eff_GAT(nn.Module):
@@ -41,7 +39,7 @@ class Eff_GAT(nn.Module):
             "resnet18": 3136,
             "resnet50": 12352,
             # visual + noisy xy + time + anchor + rough location
-            "efficientnet_b0": 6144 + 32 + 32 + 16 + 32,
+            "efficientnet_b0": 6144 + 32 + 32 + 16 + 128,
             #97792 + 32 + 32 resnet50
         }[model]
 
@@ -76,9 +74,9 @@ class Eff_GAT(nn.Module):
         
         self.rough_location_mlp = nn.Sequential(
             # rough_delta_x, rough_delta_y, radius_x, radius_y
-            nn.Linear(4, 16),
+            nn.Linear(4, 64),
             nn.GELU(),
-            nn.Linear(16, 32),
+            nn.Linear(64, 128),
         )
 
         self.final_mlp = nn.Sequential(
@@ -136,7 +134,7 @@ class Eff_GAT(nn.Module):
         rough_input = torch.cat([rough_delta.float(), rough_radius.float()], dim=-1)
         rough_feats = self.rough_location_mlp(rough_input)
         anchor_feats = self.anchor_mlp(is_anchor.float())
-        # COMBINE  and transform with MLP
+
         combined_feats = torch.cat([patch_feats, pos_feats, time_feats, anchor_feats, rough_feats], -1)
         combined_feats = self.mlp(combined_feats)
 

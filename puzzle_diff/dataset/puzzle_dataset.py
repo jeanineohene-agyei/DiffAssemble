@@ -46,7 +46,6 @@ class OCTPuzzleDataset(pyg_data.Dataset):
         self.min_total_nodes = min_total_nodes
         self.max_total_nodes = max_total_nodes
         self.min_unique_scans = min_unique_scans
-        # self.max_batch_overlap = max_batch_overlap
         self.valid_scan_start = valid_scan_start
         self.valid_scan_end = valid_scan_end
         self.margin_y = margin_y
@@ -56,13 +55,9 @@ class OCTPuzzleDataset(pyg_data.Dataset):
         self.randomize_samples = randomize_samples
         self.samples_per_volume = int(samples_per_volume)
         
-        self.rotation_overrides = {
-            "a947ccaffbe1": 1,
-        }
+        self.rotation_overrides = {"a947ccaffbe1": 1}
 
         self.default_rotation = 3
-    
-        # self.rough_location_radius = 0.35
         
         self.rough_radius_x = 0.04
         self.rough_radius_y = 0.20
@@ -84,12 +79,7 @@ class OCTPuzzleDataset(pyg_data.Dataset):
     
     def rotate_volume(self, vol, bscan_path):
         participant = Path(bscan_path).parent.name
-
-        k = self.rotation_overrides.get(
-            participant,
-            self.default_rotation,
-        )
-
+        k = self.rotation_overrides.get(participant, self.default_rotation)
         return np.rot90(vol, k=k, axes=(1, 2)).copy()
 
     def global_anatomy_crop(self, stack, seg):
@@ -118,8 +108,7 @@ class OCTPuzzleDataset(pyg_data.Dataset):
     def full_display_width(self, full_shape):
         """
         Width derived from the true image aspect ratio.
-
-        No independent X stretching.
+        No independent X stretching
         """
         _, W = full_shape
         return float(W) * self.coordinate_units_per_pixel(full_shape)
@@ -131,24 +120,12 @@ class OCTPuzzleDataset(pyg_data.Dataset):
         """
         _, W = full_shape
         center_col = (W - 1) / 2.0
-
         return (float(col) - center_col) * self.coordinate_units_per_pixel(full_shape)
-
-
-    def row_to_y_offset(self, row, full_shape):
-        """
-        Convert an image row to Y using the same scale as X.
-        """
-        H, _ = full_shape
-        center_row = (H - 1) / 2.0
-
-        return (center_row - float(row)) * self.coordinate_units_per_pixel(full_shape)
 
 
     def pixel_to_display_xy(self, row, col, y_scan, full_shape):
         x = self.col_to_full_x(col, full_shape)
         y = (float(y_scan) + self.row_to_y_offset(row, full_shape))
-
         return x, y
 
     def anatomy_center_pixels(self, img, seg):
@@ -259,12 +236,6 @@ class OCTPuzzleDataset(pyg_data.Dataset):
             
             total_nodes = sum(len(batch) for batch in batches)
             unique_scans = len(set(scan_idx for batch in batches for scan_idx in batch))
-            # valid_overlap = all(
-            #     len(set(batches[i]) & set(batches[j]))
-            #     / min(len(set(batches[i])), len(set(batches[j]))) <= self.max_batch_overlap
-            #     for i in range(len(batches))
-            #     for j in range(i + 1, len(batches))
-            # )
 
             if total_nodes >= self.min_total_nodes and total_nodes <= self.max_total_nodes and unique_scans >= self.min_unique_scans:
                 return batches
@@ -313,7 +284,7 @@ class OCTPuzzleDataset(pyg_data.Dataset):
 
         theta = rng.uniform(0.0, 2.0 * np.pi, size=num_nodes)
 
-        # sqrt gives uniform sampling over the area of the circle.
+        # sqrt gives uniform sampling over the area of the circle
         r = np.sqrt(rng.uniform(0.0, 1.0, size=num_nodes))
         dx = r * self.rough_radius_x * np.cos(theta)
         dy = r * self.rough_radius_y * np.sin(theta)
@@ -324,14 +295,14 @@ class OCTPuzzleDataset(pyg_data.Dataset):
 
         rough_delta = gt_delta + noise
 
-        # The anchor defines the local coordinate system.
+        # anchor defines the local coordinate system
         rough_delta[anchor_idx] = 0.0
 
         rough_radius = torch.zeros((num_nodes, 2), dtype=torch.float32)
         rough_radius[:, 0] = float(self.rough_radius_x)
         rough_radius[:, 1] = float(self.rough_radius_y)
 
-        # The anchor is known to be the origin.
+        # anchor is known to be the origin
         rough_radius[anchor_idx] = 0.0
 
         return rough_delta, rough_radius
@@ -356,26 +327,14 @@ class OCTPuzzleDataset(pyg_data.Dataset):
 
             neighbors = torch.where(valid)[0]
 
-            # if neighbors.numel() < min_neighbors:
-            #     distance = torch.sqrt((dx / (x_limit + 1e-8)) ** 2 + (dy / (y_limit + 1e-8)) ** 2)
-
-            #     distance[i] = float("inf")
-            #     distance[anchor_idx] = float("inf")
-
-            #     nearest = torch.argsort(distance)[:min_neighbors]
-            #     neighbors = torch.unique(torch.cat([neighbors, nearest]))
-
             for j in neighbors.tolist():
                 edges.add((i, j))
                 edges.add((j, i))
 
-        # Source anchor sends to every prediction node
+        # source anchor sends to every prediction node
         for j in range(num_nodes):
             if j != anchor_idx:
                 edges.add((anchor_idx, j))
-
-        # Anchor retains its own representation.
-        # edges.add((anchor_idx, anchor_idx))
 
         return torch.tensor(sorted(edges), dtype=torch.long).t().contiguous()
 
@@ -384,26 +343,21 @@ class OCTPuzzleDataset(pyg_data.Dataset):
         sample_idx = idx % self.samples_per_volume
         
         if self.randomize_samples:
-            # Each virtual copy gets a different puzzle.
+            # Each virtual copy gets a different puzzle
             # torch.initial_seed() differs across DataLoader workers/epochs
             # when workers are recreated.
             worker_seed = torch.initial_seed()
 
             sample_seed = (worker_seed + volume_idx * 1_000_003 + sample_idx * 10_007) % (2**32)
         else:
-            # Validation remains fixed and repeatable.
+            # validation remains fixed and repeatable
             sample_seed = (self.seed + volume_idx * 1_000_003 + sample_idx * 10_007) % (2**32)
 
         rng = np.random.default_rng(sample_seed)
 
-        bscan_path = self.bscan_paths[volume_idx]
-        seg_path = self.seg_paths[volume_idx]
-
-        stack = tiff.imread(bscan_path)
-        seg = tiff.imread(seg_path)
-
-        stack = self.rotate_volume(stack, bscan_path)
-        seg = self.rotate_volume(seg, bscan_path)
+        bscan_path, seg_path = self.bscan_paths[volume_idx], self.seg_paths[volume_idx]
+        stack, seg = tiff.imread(bscan_path), tiff.imread(seg_path)
+        stack, seg = self.rotate_volume(stack, bscan_path), self.rotate_volume(seg, bscan_path)
 
         valid_start, valid_end = self.best_valid_scan_range(seg)
 
@@ -422,12 +376,9 @@ class OCTPuzzleDataset(pyg_data.Dataset):
         y_pad = self.scan_spacing * 2
         ylim = [float(ys.min() - y_pad), float(ys.max() + y_pad)]
 
-        # crop_display_width = (self.col_to_full_x(self.crop_l, full_shape) - self.col_to_full_x(0, full_shape))
         crop_display_width = (self.crop_l * self.coordinate_units_per_pixel(full_shape))
         
-        dense_imgs = []
-        dense_scan_indices = []
-
+        dense_imgs, dense_scan_indices = [], []
         for scan_idx in dense_indices:
             dense_imgs.append(self.crop_to_patch_tensor(stack[scan_idx]))
             dense_scan_indices.append(scan_idx)
@@ -445,8 +396,7 @@ class OCTPuzzleDataset(pyg_data.Dataset):
         batches = self.sample_batches(rng, dense_indices)
 
         valid_batch_id = 0
-
-        # shared_c0, shared_c1 = self.sample_crop_cols(rng, stack.shape[2])
+        
         for batch_indices in batches:
             c0, c1 = self.sample_crop_cols(rng, stack.shape[2])
 
@@ -465,21 +415,13 @@ class OCTPuzzleDataset(pyg_data.Dataset):
                 if center_px is None:
                     continue
 
-                row, local_col = center_px
-                full_col = c0 + local_col
+                # row, local_col = center_px
+                # full_col = c0 + local_col
 
-                gx, gy = self.pixel_to_display_xy(row, full_col, y_scan, full_shape)
-                # gx = self.col_to_full_x((c0 + c1 - 1) / 2.0, full_shape)
-                # gy = float(y_scan)
-                
-                # row_offset_y = (0.5 - (row / (full_shape[0] - 1))) * self.display_height
-                # row_offset_y = self.row_to_y_offset(row, full_shape)
-                # col_offset_x = self.col_to_full_x(full_col, full_shape)
-                
-                # if idx == 0:
-                #     print(f"scan {scan_idx}: "f"row={row:.1f}, "f"full_col={full_col:.1f}, "f"x={gx:.6f}, "f"scan_y={float(y_scan):.6f}, "f"row_offset_y={row_offset_y:.6f}, "f"final_y={gy:.6f}")
-                #     print(f"x={col_offset_x:.4f}, "f"y_scan={y_scan:.4f}, "f"row_offset={row_offset_y:.4f}, "f"y={gy:.4f}")
-
+                # gx, gy = self.pixel_to_display_xy(row, full_col, y_scan, full_shape)
+                gx = self.col_to_full_x((c0 + c1 - 1) / 2.0, full_shape)
+                gy = float(y_scan)
+               
                 current_patches.append(self.crop_to_patch_tensor(img_crop))
                 current_xy.append([gx, gy])
                 current_scan_indices.append(scan_idx)
@@ -507,8 +449,8 @@ class OCTPuzzleDataset(pyg_data.Dataset):
 
         num_nodes = raw_xy.shape[0]
 
-        anchor_idx = int(rng.integers(0, num_nodes))
-        # anchor_idx = num_nodes // 2
+        # anchor_idx = int(rng.integers(0, num_nodes))
+        anchor_idx = num_nodes // 2
         anchor_xy = raw_xy[anchor_idx].clone()
 
         gt_delta = raw_xy - anchor_xy
@@ -518,6 +460,7 @@ class OCTPuzzleDataset(pyg_data.Dataset):
         y_scale = (self.dense_size - 1) * self.scan_spacing + self.display_height
 
         delta_scale = torch.tensor([x_scale, y_scale], dtype=torch.float32)
+        
         # coordinates used by the model/diffusion process
         gt_delta_model = gt_delta / delta_scale
         gt_delta_model[anchor_idx] = 0.0
@@ -525,7 +468,8 @@ class OCTPuzzleDataset(pyg_data.Dataset):
         # rough GPS-like conditioning metadata
         rough_delta, rough_radius = self.create_rough_relative_locations(gt_delta=gt_delta, anchor_idx=anchor_idx, rng=rng)
         
-        edge_index = self.make_rough_neighborhood_graph(rough_delta, rough_radius, anchor_idx)
+        # edge_index = self.make_rough_neighborhood_graph(rough_delta, rough_radius, anchor_idx)
+        edge_index = self.make_complete_graph(num_nodes)
 
         # normalize rough coordinates using the same scale as the target
         rough_delta_model = rough_delta / delta_scale
@@ -534,14 +478,14 @@ class OCTPuzzleDataset(pyg_data.Dataset):
         src = edge_index[0]
         dst = edge_index[1]
         
-        # Directed displacement from source node to destination node.
+        # directed displacement from source node to destination node
         edge_attr = rough_delta_model[dst] - rough_delta_model[src]
         
-        # Residual correction in physical coordinates.
+        # residual correction in physical coordinates
         correction = gt_delta - rough_delta
         correction[anchor_idx] = 0.0
 
-        # Normalize the residual by the uncertainty radius on each axis.
+        # normalize the residual by the uncertainty radius on each axis
         # This makes X and Y targets comparable:
         #   correction_x / 0.04
         #   correction_y / 0.20
@@ -559,21 +503,10 @@ class OCTPuzzleDataset(pyg_data.Dataset):
         rough_radius_model = rough_radius / delta_scale.unsqueeze(0)
         rough_radius_model[anchor_idx] = 0.0
         
-        # if idx == 0:
-        #     print("gt_delta x range:", gt_delta[:, 0].min().item(), gt_delta[:, 0].max().item())
-        #     print("gt_delta y range:", gt_delta[:, 1].min().item(), gt_delta[:, 1].max().item())
-        #     print("normalized x range:", gt_delta_model[:, 0].min().item(), gt_delta_model[:, 0].max().item())
-        #     print("normalized y range:", gt_delta_model[:, 1].min().item(), gt_delta_model[:, 1].max().item())
-
-        #     print("delta scale:", delta_scale.tolist())
         
-
-        #     for node_idx in range(num_nodes):
-        #         error = torch.linalg.vector_norm(rough_delta[node_idx] - gt_delta[node_idx]).item()
-        #         print(f"node {node_idx}: "f"gt={gt_delta[node_idx].tolist()}, "f"rough={rough_delta[node_idx].tolist()}, "f"error={error:.4f}, "f"radius_x={rough_radius[node_idx, 0].item():.4f}, "f"radius_y={rough_radius[node_idx, 1].item():.4f}")
-
         is_anchor = torch.zeros(num_nodes, 1, dtype=torch.float32)
         is_anchor[anchor_idx, 0] = 1.0
+        
 
         data = pyg_data.Data(
             # Diffusion model target: approximately [-1, 1] on both axes

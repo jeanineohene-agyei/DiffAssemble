@@ -2,8 +2,6 @@ import enum
 
 import logging
 
-# from .backbones.Transformer_GNN import Transformer_GNN
-from collections import defaultdict
 from functools import partial
 from pathlib import Path
 from typing import Any
@@ -19,7 +17,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torchmetrics
-from kornia.geometry.transform import Rotate as krot
 from torch import Tensor
 from tqdm import tqdm
 
@@ -343,7 +340,7 @@ class GNN_Diffusion(pl.LightningModule):
     def visual_features(self, patch_rgb):
         # patch_rgb = (patch_rgb - self.mean) / self.std
 
-        # # fe[3].reshape(fe[0].shape[0],-1)
+        # fe[3].reshape(fe[0].shape[0],-1)
         # patch_feats = self.visual_backbone.forward(patch_rgb)[3].reshape(
         #     patch_rgb.shape[0], -1
         # )
@@ -433,16 +430,9 @@ class GNN_Diffusion(pl.LightningModule):
         elif loss_type == "l2":
             loss = F.mse_loss(target, prediction)
         elif loss_type == "huber":
-            # loss = F.smooth_l1_loss(target, prediction)
-            loss_x = F.smooth_l1_loss(prediction[:, 0], target[:, 0])
-            loss_y = F.smooth_l1_loss(prediction[:, 1], target[:, 1])
+            loss = F.smooth_l1_loss(target, prediction)
         else:
             raise NotImplementedError()
-        
-        loss = loss_x + loss_y
-
-        # train_stats["train_loss_x"] = loss_x
-        # train_stats["train_loss_y"] = loss_y
 
         return loss, train_stats
 
