@@ -20,21 +20,6 @@ from dataset import dataset_utils as du
 from model import spatial_diffusion as sd
 
 
-# def get_random_string(length):
-#     # choose from all lowercase letter
-#     letters = string.ascii_lowercase
-#     result_str = "".join(random.choice(letters) for i in range(length))
-#     return result_str  # print("Random string of length", length, "is:", result_str)
-
-
-# class Percent(object):
-#     def __new__(self, percent_string):
-#         if percent_string.endswith("%"):
-#             return str(percent_string)
-#         else:
-#             return int(percent_string)
-
-
 def main(**cfg):
     train_dt, val_dt, _ = du.get_dataset(cfg)
 
@@ -42,7 +27,7 @@ def main(**cfg):
         train_dt,
         batch_size=cfg["batch_size"],
         num_workers=cfg["num_workers"],
-        shuffle=False,
+        shuffle=True,
         persistent_workers=True,
     )
 

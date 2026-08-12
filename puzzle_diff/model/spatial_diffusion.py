@@ -274,18 +274,6 @@ class GNN_Diffusion(pl.LightningModule):
                 architecture=self.architecture,
                 virt_nodes=self.virt_nodes,
             )
-
-    # def initialize_torchmetrics(self, n_patches):
-    #     metrics = {}
-
-    #     for i in n_patches:
-    #         metrics[f"{i}_acc"] = torchmetrics.MeanMetric()
-    #         metrics[f"{i}__piece_acc"] = torchmetrics.MeanMetric()
-    #         metrics[f"{i}_nImages"] = torchmetrics.SumMetric()
-    #     metrics["overall_acc"] = torchmetrics.MeanMetric()
-    #     metrics["overall__piece_acc"] = torchmetrics.MeanMetric()
-    #     metrics["overall_nImages"] = torchmetrics.SumMetric()
-    #     self.metrics = nn.ModuleDict(metrics)
     
     def initialize_torchmetrics(self, n_patches=None):
         metric_names = ["mse", "mae", "mean_dist", "x_mae", "y_mae", "x_mse", "y_mse", "rough_mean_dist", "rough_x_mae", "rough_y_mae"]
@@ -297,25 +285,7 @@ class GNN_Diffusion(pl.LightningModule):
 
     def forward(self, xy_pos, time, patch_rgb, edge_index, edge_attr, batch, is_anchor=None, rough_delta=None, rough_radius=None) -> Any:
         return self.model(xy_pos, time, patch_rgb, edge_index, edge_attr, batch, is_anchor=is_anchor, rough_delta=rough_delta, rough_radius=rough_radius)
-        # # mean = patch_rgb.new_tensor([0.4850, 0.4560, 0.4060])[None, :, None, None]
-        # # std = patch_rgb.new_tensor([0.2290, 0.2240, 0.2250])[None, :, None, None]
-        # # if patch_feats == None:
 
-        # patch_rgb = (patch_rgb - self.mean) / self.std
-
-        # # fe[3].reshape(fe[0].shape[0],-1)
-        # patch_feats = self.visual_backbone.forward(patch_rgb)[3].reshape(
-        #     patch_rgb.shape[0], -1
-        # )
-        # # patch_feats = patch_feats
-        # time_feats = self.time_emb(time)
-        # pos_feats = self.pos_mlp(xy_pos)
-        # combined_feats = torch.cat([patch_feats, pos_feats, time_feats], -1)
-        # combined_feats = self.mlp(combined_feats)
-        # feats = self.gnn_backbone(x=combined_feats, edge_index=edge_index)
-        # final_feats = self.final_mlp(feats + combined_feats)
-
-        # return final_feats
 
     def forward_with_feats(
         self,
@@ -338,14 +308,8 @@ class GNN_Diffusion(pl.LightningModule):
         return out
 
     def visual_features(self, patch_rgb):
-        # patch_rgb = (patch_rgb - self.mean) / self.std
-
-        # fe[3].reshape(fe[0].shape[0],-1)
-        # patch_feats = self.visual_backbone.forward(patch_rgb)[3].reshape(
-        #     patch_rgb.shape[0], -1
-        # )
-        # return patch_feats
         return self.model.visual_features(patch_rgb)
+    
     # forward diffusion
     def q_sample(self, x_start, t, noise=None, is_anchor=None):
         if noise is None:
@@ -406,6 +370,7 @@ class GNN_Diffusion(pl.LightningModule):
             ModelMeanType.START_X: x_start,
             ModelMeanType.EPSILON: noise,
         }[self.model_mean_type]
+
         if is_anchor is not None:
             keep = ~is_anchor.bool().view(-1)
             target = target[keep]
@@ -514,7 +479,7 @@ class GNN_Diffusion(pl.LightningModule):
     @torch.no_grad()
     def p_sample_ddim(
         self, x, t, t_index, cond, edge_index, edge_attr, patch_feats, batch, is_anchor=None, rough_delta=None, rough_radius=None
-    ):  # (self, x, t, t_index, cond):
+    ):
         if is_anchor is not None:
             anchor_mask = is_anchor.bool().view(-1, 1)
             x = x.clone()
@@ -809,6 +774,8 @@ class GNN_Diffusion(pl.LightningModule):
 
                     self.save_oct_image(
                         patches_rgb=batch.patches[idx],
+                        enface_rows=batch.enface_rows[idx],
+                        dense_enface=batch.dense_enface[i],
                         pos=pred_pos,
                         gt_pos=gt_pos,
                         raw_pos=batch.raw_xy[idx],
@@ -824,12 +791,11 @@ class GNN_Diffusion(pl.LightningModule):
                         ylim=batch.ylim.view(-1, 2)[i],
                         full_width=batch.full_width[i],
                         crop_display_width=batch.crop_display_width[i],
-                        display_height=batch.display_height[i],
+                        scan_spacing=batch.scan_spacing[i],
                         title_prefix="train",
                     )
 
         self.log("train_loss", loss, on_step=True, on_epoch=True, prog_bar=True, logger=True, batch_size=batch_size,)
-        # self.log("loss", loss)
         return loss
 
     @torch.no_grad()
@@ -933,6 +899,8 @@ class GNN_Diffusion(pl.LightningModule):
 
                 self.save_oct_image(
                     patches_rgb=batch.patches[idx],
+                    enface_rows=batch.enface_rows[idx],
+                    dense_enface=batch.dense_enface[i],
                     pos=pred_pos,
                     gt_pos=gt_pos,
                     raw_pos=batch.raw_xy[idx, :2],
@@ -948,7 +916,7 @@ class GNN_Diffusion(pl.LightningModule):
                     ylim=batch.ylim.view(-1, 2)[i],
                     full_width=batch.full_width[i],
                     crop_display_width=batch.crop_display_width[i],
-                    display_height=batch.display_height[i],
+                    scan_spacing=batch.scan_spacing[i],
                     title_prefix=split,
                 )
             
@@ -1047,44 +1015,47 @@ class GNN_Diffusion(pl.LightningModule):
                         file_name=save_path,
                         correct=correct,
                     )
+        
+    def normalize_enface(self, img):
+        img = np.asarray(img, dtype=np.float32)
+        valid = img[img > 0]
 
-    def oct_patch_to_numpy(self, patch):
-        # patch: [3, H, W], already normalized 0..1 from dataset
-        img = patch[0].detach().cpu().numpy().astype(np.float32)
+        if valid.size == 0:
+            return img
+
+        lo, hi = np.percentile(valid, [1, 99])
+        img = (img - lo) / (hi - lo + 1e-8)
+
         return np.clip(img, 0.0, 1.0)
 
-    def add_oct_patch(
-        self,
-        ax,
-        patch,
-        x_center,
-        y_center,
-        display_height=0.55,
-        crop_width=0.20,
-        alpha_floor=0.10,
-        zorder=2,
-    ):
-        img = self.oct_patch_to_numpy(patch)
 
-        alpha = np.clip((img - alpha_floor) / (1.0 - alpha_floor), 0, 1)
+    def add_enface_row(self, ax, row, x_center, y_center, crop_width, scan_spacing, zorder=2):
+        row = np.asarray(row, dtype=np.float32).reshape(1, -1)
+
+        alpha = (row > 0).astype(np.float32)
 
         ax.imshow(
-            img,
+            row,
             cmap="gray",
             extent=[
                 x_center - crop_width / 2,
                 x_center + crop_width / 2,
-                y_center - display_height / 2,
-                y_center + display_height / 2,
+                y_center - scan_spacing / 2,
+                y_center + scan_spacing / 2,
             ],
+            origin="upper",
             aspect="auto",
             alpha=alpha,
+            vmin=0.0,
+            vmax=1.0,
             zorder=zorder,
         )
+        # ax.set_aspect("equal", adjustable="box")
 
     def save_oct_image(
         self,
         patches_rgb,
+        enface_rows,
         pos,
         gt_pos,
         raw_pos,
@@ -1094,131 +1065,137 @@ class GNN_Diffusion(pl.LightningModule):
         ind_name,
         file_name: Path,
         dense_imgs,
+        dense_enface,
         dense_scan_indices,
         dense_y,
         xlim,
         ylim,
         full_width,
         crop_display_width,
-        display_height,
+        scan_spacing,
         title_prefix="train",
     ):
         file_name.mkdir(parents=True, exist_ok=True)
 
-        patches_rgb = patches_rgb.detach().cpu()
         pos = pos.detach().cpu()
         gt_pos = gt_pos.detach().cpu()
         raw_pos = raw_pos.detach().cpu()
+
         scan_indices = scan_indices.detach().cpu().view(-1)
         batch_ids = batch_ids.detach().cpu().view(-1)
         is_anchor = is_anchor.detach().cpu().bool().view(-1)
 
-        dense_imgs = dense_imgs.detach().cpu()
+        enface_rows = enface_rows.detach().cpu().numpy()
+
+        dense_enface = dense_enface.detach().cpu().numpy()
         dense_scan_indices = dense_scan_indices.detach().cpu().view(-1)
         dense_y = dense_y.detach().cpu().view(-1)
 
         raw_xlim = xlim.detach().cpu().view(-1).tolist()
         raw_ylim = ylim.detach().cpu().view(-1).tolist()
+
         raw_xlim = [float(raw_xlim[0]), float(raw_xlim[1])]
         raw_ylim = [float(raw_ylim[0]), float(raw_ylim[1])]
 
         full_width = float(full_width.detach().cpu().view(-1)[0])
         crop_display_width = float(crop_display_width.detach().cpu().view(-1)[0])
-        display_height = float(display_height.detach().cpu().view(-1)[0])
+        scan_spacing = float(scan_spacing.detach().cpu().view(-1)[0])
 
-        show_dense = (
-            self.include_dense_vis
-            and self.current_epoch < self.dense_vis_epochs
-            and dense_imgs.numel() > 0
-        )
+        # Normalize all puzzle en-face rows together so intensity scale
+        # remains consistent between nodes.
+        enface_rows = self.normalize_enface(enface_rows)
+
+        dense_enface = np.squeeze(dense_enface)
+        dense_enface = self.normalize_enface(dense_enface)
+
+        show_dense = self.include_dense_vis and self.current_epoch < self.dense_vis_epochs and dense_enface.size > 0
 
         if show_dense:
-            fig, axes = plt.subplots(1, 4, figsize=(24, 12))
+            fig, axes = plt.subplots(1, 4, figsize=(40, 6))
             dense_ax = axes[0]
             original_ax = axes[1]
             gt_ax = axes[2]
             pred_ax = axes[3]
         else:
-            fig, axes = plt.subplots(1, 3, figsize=(18, 12))
+            fig, axes = plt.subplots(1, 3, figsize=(30, 6))
             original_ax = axes[0]
             gt_ax = axes[1]
             pred_ax = axes[2]
 
+        for ax in axes:
+            ax.set_box_aspect(0.35)
+
+        # determine axis limits
         raw_x_span = raw_xlim[1] - raw_xlim[0]
         raw_y_span = raw_ylim[1] - raw_ylim[0]
 
-        needed_x_min = min(float(gt_pos[:, 0].min()) - crop_display_width / 2, 0.0)
-        needed_x_max = max(float(gt_pos[:, 0].max()) + crop_display_width / 2, 0.0)
-        needed_y_min = min(float(gt_pos[:, 1].min()) - display_height / 2, 0.0)
-        needed_y_max = max(float(gt_pos[:, 1].max()) + display_height / 2, 0.0)
+        needed_x_min = min(float(gt_pos[:, 0].min()) - crop_display_width / 2, float(pos[:, 0].min()) - crop_display_width / 2, 0.0)
+        needed_x_max = max(float(gt_pos[:, 0].max()) + crop_display_width / 2, float(pos[:, 0].max()) + crop_display_width / 2, 0.0)
+
+        needed_y_min = min(float(gt_pos[:, 1].min()) - scan_spacing / 2, float(pos[:, 1].min()) - scan_spacing / 2, 0.0)
+        needed_y_max = max(float(gt_pos[:, 1].max()) + scan_spacing / 2, float(pos[:, 1].max()) + scan_spacing / 2, 0.0)
 
         anchored_x_span = max(raw_x_span, needed_x_max - needed_x_min)
-        anchored_y_span = max(raw_y_span, needed_y_max - needed_y_min)
+        anchored_y_span = max(raw_y_span,  needed_y_max - needed_y_min)
 
         anchored_x_center = (needed_x_min + needed_x_max) / 2
         anchored_y_center = (needed_y_min + needed_y_max) / 2
 
-        anchored_xlim = [
-            anchored_x_center - anchored_x_span / 2,
-            anchored_x_center + anchored_x_span / 2,
-        ]
+        anchored_xlim = [anchored_x_center - anchored_x_span / 2, anchored_x_center + anchored_x_span / 2]
+        anchored_ylim = [anchored_y_center - anchored_y_span / 2, anchored_y_center + anchored_y_span / 2]
 
-        anchored_ylim = [
-            anchored_y_center - anchored_y_span / 2,
-            anchored_y_center + anchored_y_span / 2,
-        ]
-
-        # Dense-volume panel, only shown for the first dense_vis_epochs.
+        # dense reference en-face view
         if show_dense:
             ax = dense_ax
 
-            for j in range(dense_imgs.shape[0]):
-                y_center = float(dense_y[j])
+            if len(dense_y) > 0:
+                dense_y_max = float(dense_y.max()) + scan_spacing / 2
+                dense_y_min = float(dense_y.min()) - scan_spacing / 2
+            else:
+                dense_y_min, dense_y_max = raw_ylim
 
-                self.add_oct_patch(
-                    ax=ax,
-                    patch=dense_imgs[j],
-                    x_center=0.0,
-                    y_center=y_center,
-                    display_height=display_height,
-                    crop_width=full_width,
-                    alpha_floor=0.10,
-                    zorder=1,
-                )
-
-                ax.text(
-                    raw_xlim[0],
-                    y_center,
-                    str(int(dense_scan_indices[j])),
-                    ha="right",
-                    va="center",
-                    fontsize=6,
-                )
+            ax.imshow(
+                dense_enface,
+                cmap="gray",
+                extent=[
+                    -full_width / 2,
+                    full_width / 2,
+                    dense_y_min,
+                    dense_y_max,
+                ],
+                origin="upper",
+                aspect="auto",
+                vmin=0.0,
+                vmax=1.0,
+            )
+            ax.set_xlim(raw_xlim)
+            ax.set_ylim(raw_ylim)
+            # ax.set_aspect("equal", adjustable="box")
 
             ax.set_xlim(raw_xlim)
             ax.set_ylim(raw_ylim)
-            ax.grid(alpha=0.3)
-            ax.set_title("Dense volume")
-            ax.set_xlabel("Full scan width")
-            ax.set_ylabel("Scan position")
 
-        # Original crop positions.
+            ax.grid(alpha=0.3)
+            ax.set_title("Dense en-face reference")
+            ax.set_xlabel("Surface x")
+            ax.set_ylabel("Surface y")
+
+        # original crop positions
         ax = original_ax
 
-        for p in range(patches_rgb.shape[0]):
-            self.add_oct_patch(
+        for p in range(enface_rows.shape[0]):
+            self.add_enface_row(
                 ax=ax,
-                patch=patches_rgb[p],
+                row=enface_rows[p],
                 x_center=float(raw_pos[p, 0]),
                 y_center=float(raw_pos[p, 1]),
-                display_height=display_height,
                 crop_width=crop_display_width,
-                alpha_floor=0.10,
+                scan_spacing=scan_spacing,
                 zorder=2,
             )
 
             marker = "*" if is_anchor[p] else "x"
-            marker_size = 100 if is_anchor[p] else 35
+            marker_size = 100 if is_anchor[p] else 25
 
             ax.scatter(
                 float(raw_pos[p, 0]),
@@ -1231,7 +1208,10 @@ class GNN_Diffusion(pl.LightningModule):
             ax.text(
                 float(raw_pos[p, 0]) + 0.005,
                 float(raw_pos[p, 1]),
-                "s{} b{}".format(int(scan_indices[p]), int(batch_ids[p])),
+                "s{} b{}".format(
+                    int(scan_indices[p]),
+                    int(batch_ids[p]),
+                ),
                 fontsize=6,
                 va="center",
                 zorder=11,
@@ -1239,28 +1219,30 @@ class GNN_Diffusion(pl.LightningModule):
 
         ax.set_xlim(raw_xlim)
         ax.set_ylim(raw_ylim)
+        
+        # ax.set_aspect("equal", adjustable="box")
+
         ax.grid(alpha=0.3)
         ax.set_title("Original crop positions")
         ax.set_xlabel("Original x")
         ax.set_ylabel("Original y")
 
-        # Anchor-relative ground truth.
+        # ground truth after anchor translation
         ax = gt_ax
 
-        for p in range(patches_rgb.shape[0]):
-            self.add_oct_patch(
+        for p in range(enface_rows.shape[0]):
+            self.add_enface_row(
                 ax=ax,
-                patch=patches_rgb[p],
+                row=enface_rows[p],
                 x_center=float(gt_pos[p, 0]),
                 y_center=float(gt_pos[p, 1]),
-                display_height=display_height,
                 crop_width=crop_display_width,
-                alpha_floor=0.10,
+                scan_spacing=scan_spacing,
                 zorder=2,
             )
 
             marker = "*" if is_anchor[p] else "x"
-            marker_size = 100 if is_anchor[p] else 35
+            marker_size = 100 if is_anchor[p] else 25
 
             ax.scatter(
                 float(gt_pos[p, 0]),
@@ -1273,38 +1255,55 @@ class GNN_Diffusion(pl.LightningModule):
             ax.text(
                 float(gt_pos[p, 0]) + 0.005,
                 float(gt_pos[p, 1]),
-                "s{} b{}".format(int(scan_indices[p]), int(batch_ids[p])),
+                "s{} b{}".format(
+                    int(scan_indices[p]),
+                    int(batch_ids[p]),
+                ),
                 fontsize=6,
                 va="center",
                 zorder=11,
             )
 
-        ax.axhline(0.0, color="black", linewidth=1.8, alpha=0.9, zorder=0)
-        ax.axvline(0.0, color="black", linewidth=1.8, alpha=0.9, zorder=0)
+        ax.axhline(
+            0.0,
+            color="black",
+            linewidth=1.8,
+            alpha=0.9,
+            zorder=0,
+        )
+
+        ax.axvline(
+            0.0,
+            color="black",
+            linewidth=1.8,
+            alpha=0.9,
+            zorder=0,
+        )
+
         ax.set_xlim(anchored_xlim)
         ax.set_ylim(anchored_ylim)
+        # ax.set_aspect("equal", adjustable="box")
         ax.grid(alpha=0.3)
         ax.set_title("Ground truth after anchor translation")
         ax.set_xlabel("Anchor-relative x")
         ax.set_ylabel("Anchor-relative y")
 
-        # Current diffusion prediction.
+        # predicted / refined positions
         ax = pred_ax
 
-        for p in range(patches_rgb.shape[0]):
-            self.add_oct_patch(
+        for p in range(enface_rows.shape[0]):
+            self.add_enface_row(
                 ax=ax,
-                patch=patches_rgb[p],
+                row=enface_rows[p],
                 x_center=float(pos[p, 0]),
                 y_center=float(pos[p, 1]),
-                display_height=display_height,
                 crop_width=crop_display_width,
-                alpha_floor=0.10,
+                scan_spacing=scan_spacing,
                 zorder=2,
             )
 
             marker = "*" if is_anchor[p] else "x"
-            marker_size = 100 if is_anchor[p] else 35
+            marker_size = 100 if is_anchor[p] else 25
 
             ax.scatter(
                 float(pos[p, 0]),
@@ -1317,21 +1316,40 @@ class GNN_Diffusion(pl.LightningModule):
             ax.text(
                 float(pos[p, 0]) + 0.005,
                 float(pos[p, 1]),
-                "s{} b{}".format(int(scan_indices[p]), int(batch_ids[p])),
+                "s{} b{}".format(
+                    int(scan_indices[p]),
+                    int(batch_ids[p]),
+                ),
                 fontsize=6,
                 va="center",
                 zorder=11,
             )
 
-        ax.axhline(0.0, color="black", linewidth=1.8, alpha=0.9, zorder=0)
-        ax.axvline(0.0, color="black", linewidth=1.8, alpha=0.9, zorder=0)
+        ax.axhline(
+            0.0,
+            color="black",
+            linewidth=1.8,
+            alpha=0.9,
+            zorder=0,
+        )
+
+        ax.axvline(
+            0.0,
+            color="black",
+            linewidth=1.8,
+            alpha=0.9,
+            zorder=0,
+        )
+
         ax.set_xlim(anchored_xlim)
         ax.set_ylim(anchored_ylim)
+        # ax.set_aspect("equal", adjustable="box")
         ax.grid(alpha=0.3)
         ax.set_title("Refined position")
         ax.set_xlabel("Anchor-relative x")
         ax.set_ylabel("Anchor-relative y")
 
+        # error + save
         non_anchor = ~is_anchor
 
         if non_anchor.any():
@@ -1342,7 +1360,9 @@ class GNN_Diffusion(pl.LightningModule):
         else:
             mean_dist = 0.0
 
-        sample_id = int(ind_name.detach().cpu().view(-1)[0])
+        sample_id = int(
+            ind_name.detach().cpu().view(-1)[0]
+        )
 
         fig.suptitle(
             "{} epoch {} sample {} mean_dist {:.4f}".format(
@@ -1353,7 +1373,7 @@ class GNN_Diffusion(pl.LightningModule):
             )
         )
 
-        plt.tight_layout()
+        plt.tight_layout(rect=[0, 0, 1, 0.94])
 
         out_path = file_name / "oct_epoch{}_sample{}.png".format(
             self.current_epoch,
@@ -1373,6 +1393,5 @@ class GNN_Diffusion(pl.LightningModule):
             "global_step": self.global_step,
         })
 
-        plt.savefig(out_path, dpi=150)
+        plt.savefig(out_path, dpi=300, bbox_inches="tight")
         plt.close(fig)
-        

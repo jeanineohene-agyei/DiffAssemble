@@ -27,6 +27,280 @@ def get_volume_key(path: Path) -> str:
     return path.name.removesuffix(suffix)
 
 
+import numpy as np
+import torch
+
+
+def tensor_np(x):
+    if torch.is_tensor(x):
+        return x.detach().cpu().numpy()
+    return np.asarray(x)
+
+
+def axis_stats(name, arr):
+    arr = np.asarray(arr, dtype=np.float64)
+
+    if arr.ndim == 1:
+        arr = arr[:, None]
+
+    lines = []
+    lines.append(f"\n{name}")
+    lines.append("-" * len(name))
+
+    axis_names = ["x", "y"]
+
+    for d in range(arr.shape[1]):
+        values = arr[:, d]
+        label = axis_names[d] if d < 2 else str(d)
+
+        lines.append(
+            f"{label}: "
+            f"min={values.min():.6f}, "
+            f"p01={np.percentile(values, 1):.6f}, "
+            f"p05={np.percentile(values, 5):.6f}, "
+            f"median={np.median(values):.6f}, "
+            f"mean={values.mean():.6f}, "
+            f"p95={np.percentile(values, 95):.6f}, "
+            f"p99={np.percentile(values, 99):.6f}, "
+            f"max={values.max():.6f}, "
+            f"std={values.std():.6f}, "
+            f"mean_abs={np.abs(values).mean():.6f}"
+        )
+
+    return lines
+
+
+def audit_coordinate_scales(dataset, output_path="coordinate_audit.txt", num_samples=200):
+    num_samples = min(num_samples, len(dataset))
+
+    all_raw_xy = []
+    all_gt_delta = []
+    all_gt_delta_model = []
+
+    all_rough_delta = []
+    all_rough_delta_model = []
+
+    all_correction = []
+    all_correction_model = []
+
+    all_rough_radius = []
+    all_rough_radius_model = []
+
+    delta_scales = []
+    correction_scales = []
+
+    node_counts = []
+    batch_counts = []
+
+    raw_x_ranges = []
+    raw_y_ranges = []
+
+    gt_x_ranges = []
+    gt_y_ranges = []
+
+    lines = []
+
+    lines.append("OCT COORDINATE / ROUGH POSITION AUDIT")
+    lines.append("=" * 80)
+    lines.append(f"Samples audited: {num_samples}")
+
+    if hasattr(dataset, "x_spacing_mm"):
+        lines.append(f"x_spacing_mm: {dataset.x_spacing_mm:.6f}")
+
+    if hasattr(dataset, "y_spacing_mm"):
+        lines.append(f"y_spacing_mm: {dataset.y_spacing_mm:.6f}")
+
+    if hasattr(dataset, "dense_size"):
+        lines.append(f"dense_size: {dataset.dense_size}")
+
+    if hasattr(dataset, "crop_l"):
+        lines.append(f"crop_l: {dataset.crop_l}")
+
+    if hasattr(dataset, "rough_radius_x"):
+        lines.append(f"configured rough_radius_x: {dataset.rough_radius_x:.6f}")
+
+    if hasattr(dataset, "rough_radius_y"):
+        lines.append(f"configured rough_radius_y: {dataset.rough_radius_y:.6f}")
+
+    for i in range(num_samples):
+        data = dataset[i]
+
+        raw_xy = tensor_np(data.raw_xy).reshape(-1, 2)
+        gt_delta = tensor_np(data.gt_delta).reshape(-1, 2)
+        gt_delta_model = tensor_np(data.gt_delta_model).reshape(-1, 2)
+
+        rough_delta = tensor_np(data.rough_delta).reshape(-1, 2)
+        rough_delta_model = tensor_np(data.rough_delta_model).reshape(-1, 2)
+
+        correction = tensor_np(data.correction).reshape(-1, 2)
+        correction_model = tensor_np(data.correction_model).reshape(-1, 2)
+
+        rough_radius = tensor_np(data.rough_radius).reshape(-1, 2)
+        rough_radius_model = tensor_np(data.rough_radius_model).reshape(-1, 2)
+
+        delta_scale = tensor_np(data.delta_scale).reshape(-1, 2)[0]
+        correction_scale = tensor_np(data.correction_scale).reshape(-1, 2)[0]
+
+        all_raw_xy.append(raw_xy)
+        all_gt_delta.append(gt_delta)
+        all_gt_delta_model.append(gt_delta_model)
+
+        all_rough_delta.append(rough_delta)
+        all_rough_delta_model.append(rough_delta_model)
+
+        all_correction.append(correction)
+        all_correction_model.append(correction_model)
+
+        all_rough_radius.append(rough_radius)
+        all_rough_radius_model.append(rough_radius_model)
+
+        delta_scales.append(delta_scale)
+        correction_scales.append(correction_scale)
+
+        node_counts.append(raw_xy.shape[0])
+        batch_counts.append(len(np.unique(tensor_np(data.batch_ids))))
+
+        raw_x_ranges.append(raw_xy[:, 0].max() - raw_xy[:, 0].min())
+        raw_y_ranges.append(raw_xy[:, 1].max() - raw_xy[:, 1].min())
+
+        gt_x_ranges.append(gt_delta[:, 0].max() - gt_delta[:, 0].min())
+        gt_y_ranges.append(gt_delta[:, 1].max() - gt_delta[:, 1].min())
+
+    raw_xy = np.concatenate(all_raw_xy, axis=0)
+    gt_delta = np.concatenate(all_gt_delta, axis=0)
+    gt_delta_model = np.concatenate(all_gt_delta_model, axis=0)
+
+    rough_delta = np.concatenate(all_rough_delta, axis=0)
+    rough_delta_model = np.concatenate(all_rough_delta_model, axis=0)
+
+    correction = np.concatenate(all_correction, axis=0)
+    correction_model = np.concatenate(all_correction_model, axis=0)
+
+    rough_radius = np.concatenate(all_rough_radius, axis=0)
+    rough_radius_model = np.concatenate(all_rough_radius_model, axis=0)
+
+    delta_scales = np.stack(delta_scales)
+    correction_scales = np.stack(correction_scales)
+
+    lines.append("\nSAMPLE STRUCTURE")
+    lines.append("-" * 80)
+    lines.append(
+        f"nodes/sample: min={np.min(node_counts)}, "
+        f"mean={np.mean(node_counts):.2f}, "
+        f"max={np.max(node_counts)}"
+    )
+    lines.append(
+        f"batches/sample: min={np.min(batch_counts)}, "
+        f"mean={np.mean(batch_counts):.2f}, "
+        f"max={np.max(batch_counts)}"
+    )
+
+    lines.append("\nPER-SAMPLE RAW POSITION SPAN")
+    lines.append("-" * 80)
+    lines.append(
+        f"x span mm: mean={np.mean(raw_x_ranges):.6f}, "
+        f"median={np.median(raw_x_ranges):.6f}, "
+        f"p95={np.percentile(raw_x_ranges, 95):.6f}, "
+        f"max={np.max(raw_x_ranges):.6f}"
+    )
+    lines.append(
+        f"y span mm: mean={np.mean(raw_y_ranges):.6f}, "
+        f"median={np.median(raw_y_ranges):.6f}, "
+        f"p95={np.percentile(raw_y_ranges, 95):.6f}, "
+        f"max={np.max(raw_y_ranges):.6f}"
+    )
+
+    lines += axis_stats("RAW XY (mm)", raw_xy)
+    lines += axis_stats("GT DELTA (mm, anchor-relative)", gt_delta)
+    lines += axis_stats("GT DELTA MODEL (normalized)", gt_delta_model)
+
+    lines += axis_stats("ROUGH DELTA (mm)", rough_delta)
+    lines += axis_stats("ROUGH DELTA MODEL (normalized)", rough_delta_model)
+
+    lines += axis_stats("CORRECTION = GT - ROUGH (mm)", correction)
+    lines += axis_stats("CORRECTION MODEL = CORRECTION / ROUGH RADIUS", correction_model)
+
+    lines += axis_stats("ROUGH RADIUS (mm)", rough_radius)
+    lines += axis_stats("ROUGH RADIUS MODEL", rough_radius_model)
+
+    lines += axis_stats("DELTA SCALE", delta_scales)
+    lines += axis_stats("CORRECTION SCALE", correction_scales)
+
+    lines.append("\nROUGH ERROR RELATIVE TO DATA")
+    lines.append("-" * 80)
+
+    for d, axis in enumerate(["x", "y"]):
+        abs_corr = np.abs(correction[:, d])
+        abs_gt = np.abs(gt_delta[:, d])
+
+        lines.append(f"\n{axis.upper()}:")
+
+        lines.append(
+            f"  correction absolute error: "
+            f"median={np.median(abs_corr):.6f} mm, "
+            f"mean={np.mean(abs_corr):.6f} mm, "
+            f"p95={np.percentile(abs_corr, 95):.6f} mm, "
+            f"max={np.max(abs_corr):.6f} mm"
+        )
+
+        lines.append(
+            f"  |gt_delta|: "
+            f"median={np.median(abs_gt):.6f} mm, "
+            f"mean={np.mean(abs_gt):.6f} mm, "
+            f"p95={np.percentile(abs_gt, 95):.6f} mm"
+        )
+
+        nonzero_radius = rough_radius[:, d] > 0
+
+        if nonzero_radius.any():
+            ratio = abs_corr[nonzero_radius] / rough_radius[nonzero_radius, d]
+
+            lines.append(
+                f"  |correction| / rough_radius: "
+                f"median={np.median(ratio):.4f}, "
+                f"mean={np.mean(ratio):.4f}, "
+                f"p95={np.percentile(ratio, 95):.4f}, "
+                f"max={np.max(ratio):.4f}"
+            )
+
+            lines.append(
+                f"  fraction > radius: {(ratio > 1.0).mean() * 100:.2f}%"
+            )
+
+    lines.append("\nNORMALIZED TARGET CHECKS")
+    lines.append("-" * 80)
+
+    for arr, name in [
+        (gt_delta_model, "gt_delta_model"),
+        (rough_delta_model, "rough_delta_model"),
+        (correction_model, "correction_model"),
+    ]:
+        lines.append(
+            f"{name}: "
+            f"|x|>1 = {(np.abs(arr[:, 0]) > 1).mean() * 100:.2f}%, "
+            f"|y|>1 = {(np.abs(arr[:, 1]) > 1).mean() * 100:.2f}%"
+        )
+
+    if hasattr(dataset, "x_spacing_mm") and hasattr(dataset, "rough_radius_x"):
+        lines.append("\nRADIUS VS ACQUISITION SPACING")
+        lines.append("-" * 80)
+
+        lines.append(
+            f"rough_radius_x / x_spacing = "
+            f"{dataset.rough_radius_x / dataset.x_spacing_mm:.3f} lateral samples"
+        )
+
+        lines.append(
+            f"rough_radius_y / y_spacing = "
+            f"{dataset.rough_radius_y / dataset.y_spacing_mm:.3f} B-scan intervals"
+        )
+
+    with open(output_path, "w") as f:
+        f.write("\n".join(lines))
+
+    print(f"Saved coordinate audit to: {output_path}")
+
+
 def get_dataset(cfg):
     root = Path(cfg["oct_root"])
 
@@ -178,6 +452,12 @@ def get_dataset(cfg):
         randomize_samples=cfg["randomize_samples"],
         samples_per_volume=cfg["samples_per_volume"],
         **common_dataset_args,
+    )
+
+    audit_coordinate_scales(
+        train_dt,
+        output_path="coordinate_audit.txt",
+        num_samples=10,
     )
 
     val_dt = OCTPuzzleDataset(

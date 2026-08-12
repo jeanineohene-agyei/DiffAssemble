@@ -26,8 +26,6 @@ class OCTPuzzleDataset(pyg_data.Dataset):
         margin_x_left=260,
         margin_x_right=260,
         min_mask_pixels=500,
-        display_height=0.55,
-        scan_spacing=0.05,
         seed=42,
         randomize_samples=False,
         samples_per_volume=1,
@@ -59,11 +57,20 @@ class OCTPuzzleDataset(pyg_data.Dataset):
 
         self.default_rotation = 3
         
-        self.rough_radius_x = 0.04
-        self.rough_radius_y = 0.20
+        # physical anterior OCT acquisition geometry (from the paper where the data comes from)
+        self.full_fov_x_mm = 35.0
+        self.full_fov_y_mm = 17.5
+        self.full_num_ascans = 500
+        self.full_num_bscans = 250
 
-        self.display_height = display_height
-        self.scan_spacing = scan_spacing
+        self.x_spacing_mm = self.full_fov_x_mm / self.full_num_ascans
+        self.y_spacing_mm = self.full_fov_y_mm / self.full_num_bscans
+
+        self.rough_radius_x = 10 * self.x_spacing_mm
+        self.rough_radius_y = 10 * self.y_spacing_mm
+
+        self.enface_depth_pixels = 100
+        
         if seed is None:
             self.seed = np.random.SeedSequence().generate_state(1)[0].item()
         else:
@@ -81,52 +88,7 @@ class OCTPuzzleDataset(pyg_data.Dataset):
         participant = Path(bscan_path).parent.name
         k = self.rotation_overrides.get(participant, self.default_rotation)
         return np.rot90(vol, k=k, axes=(1, 2)).copy()
-
-    def global_anatomy_crop(self, stack, seg):
-        mask = seg > 0
-        rows = np.where(mask.any(axis=(0, 2)))[0]
-        cols = np.where(mask.any(axis=(0, 1)))[0]
-
-        r0 = max(0, rows[0] - self.margin_y)
-        r1 = min(stack.shape[1], rows[-1] + self.margin_y)
-        c0 = max(0, cols[0] - self.margin_x_left)
-        c1 = min(stack.shape[2], cols[-1] + self.margin_x_right)
-
-        return stack[:, r0:r1, c0:c1], seg[:, r0:r1, c0:c1]
-
-    def coordinate_units_per_pixel(self, full_shape):
-        """
-        Shared coordinate scale for both image axes.
-
-        The complete B-scan height represents self.display_height
-        arbitrary coordinate units.
-        """
-        H, _ = full_shape
-        return float(self.display_height) / float(H)
-
-
-    def full_display_width(self, full_shape):
-        """
-        Width derived from the true image aspect ratio.
-        No independent X stretching
-        """
-        _, W = full_shape
-        return float(W) * self.coordinate_units_per_pixel(full_shape)
-
-
-    def col_to_full_x(self, col, full_shape):
-        """
-        Convert a full-image column to X using the shared pixel scale.
-        """
-        _, W = full_shape
-        center_col = (W - 1) / 2.0
-        return (float(col) - center_col) * self.coordinate_units_per_pixel(full_shape)
-
-
-    def pixel_to_display_xy(self, row, col, y_scan, full_shape):
-        x = self.col_to_full_x(col, full_shape)
-        y = (float(y_scan) + self.row_to_y_offset(row, full_shape))
-        return x, y
+    
 
     def anatomy_center_pixels(self, img, seg):
         m = seg > 0
@@ -158,6 +120,7 @@ class OCTPuzzleDataset(pyg_data.Dataset):
 
         ranges.append((start, prev))
         return ranges
+
 
     def fill_small_gaps(self, valid_mask, max_gap=1):
         valid_mask = valid_mask.copy()
@@ -239,6 +202,7 @@ class OCTPuzzleDataset(pyg_data.Dataset):
 
             if total_nodes >= self.min_total_nodes and total_nodes <= self.max_total_nodes and unique_scans >= self.min_unique_scans:
                 return batches
+            
         raise RuntimeError(f"Could not sample a puzzle with at least {self.min_total_nodes} nodes, at most {self.max_total_nodes} nodes, and {self.min_unique_scans} unique scans.")
 
     def sample_crop_cols(self, rng, W):
@@ -289,10 +253,7 @@ class OCTPuzzleDataset(pyg_data.Dataset):
         dx = r * self.rough_radius_x * np.cos(theta)
         dy = r * self.rough_radius_y * np.sin(theta)
 
-        noise = np.stack([dx, dy], axis=1).astype(np.float32)
-
-        noise = torch.from_numpy(noise)
-
+        noise = torch.from_numpy(np.stack([dx, dy], axis=1).astype(np.float32))
         rough_delta = gt_delta + noise
 
         # anchor defines the local coordinate system
@@ -337,17 +298,46 @@ class OCTPuzzleDataset(pyg_data.Dataset):
                 edges.add((anchor_idx, j))
 
         return torch.tensor(sorted(edges), dtype=torch.long).t().contiguous()
+    
+    def col_to_surface_x(self, col, width):
+        center_col = (width - 1) / 2.0
+        return (float(col) - center_col) * self.x_spacing_mm
+
+
+    def make_enface_row(self, img_crop, seg_crop, depth_pixels=100):
+        H, W = img_crop.shape
+        enface_row = np.zeros(W, dtype=np.float32)
+
+        for x in range(W):
+            rows = np.where(seg_crop[:, x] > 0)[0]
+
+            if len(rows) == 0:
+                continue
+
+            surface_row = rows[0]
+            depth_end = min(surface_row + depth_pixels, H)
+            values = img_crop[surface_row:depth_end, x]
+
+            if len(values) > 0:
+                enface_row[x] = values.mean()
+
+        return torch.from_numpy(enface_row).float()
+    
+    
+    def make_enface_projection(self, stack, seg, scan_indices, depth_pixels=100):
+        rows = []
+        for scan_idx in scan_indices:
+            rows.append(
+                self.make_enface_row(stack[scan_idx], seg[scan_idx], depth_pixels=depth_pixels))
+        return torch.stack(rows)
+
 
     def get(self, idx):
         volume_idx = idx // self.samples_per_volume
         sample_idx = idx % self.samples_per_volume
         
         if self.randomize_samples:
-            # Each virtual copy gets a different puzzle
-            # torch.initial_seed() differs across DataLoader workers/epochs
-            # when workers are recreated.
             worker_seed = torch.initial_seed()
-
             sample_seed = (worker_seed + volume_idx * 1_000_003 + sample_idx * 10_007) % (2**32)
         else:
             # validation remains fixed and repeatable
@@ -362,21 +352,23 @@ class OCTPuzzleDataset(pyg_data.Dataset):
         valid_start, valid_end = self.best_valid_scan_range(seg)
 
         dense_indices = self.sample_dense_indices(rng, stack.shape[0], valid_start, valid_end)
+        dense_enface = self.make_enface_projection(stack, seg, dense_indices, depth_pixels=100)
 
         full_shape = stack[0].shape
-        full_width = self.full_display_width(full_shape)
+        _, full_width_pixels = full_shape
 
-        center = (len(dense_indices) - 1) / 2
-        ys = (center - np.arange(len(dense_indices))) * self.scan_spacing
+        full_width_mm = full_width_pixels * self.x_spacing_mm
+
+        center_row = (len(dense_indices) - 1) / 2.0
+        ys = (center_row - np.arange(len(dense_indices))) * self.y_spacing_mm
         idx_to_y = dict(zip(dense_indices, ys))
 
-        x_pad = 0.05 * full_width
-        xlim = [-full_width / 2 - x_pad, full_width / 2 + x_pad]
+        dense_height_mm = len(dense_indices) * self.y_spacing_mm
 
-        y_pad = self.scan_spacing * 2
-        ylim = [float(ys.min() - y_pad), float(ys.max() + y_pad)]
+        xlim = [-full_width_mm / 2.0, full_width_mm / 2.0]
+        ylim = [-dense_height_mm / 2.0, dense_height_mm / 2.0]
 
-        crop_display_width = (self.crop_l * self.coordinate_units_per_pixel(full_shape))
+        crop_display_width = self.crop_l * self.x_spacing_mm
         
         dense_imgs, dense_scan_indices = [], []
         for scan_idx in dense_indices:
@@ -388,13 +380,13 @@ class OCTPuzzleDataset(pyg_data.Dataset):
         dense_y = torch.tensor(ys, dtype=torch.float32)
 
         node_patches = []
+        node_enface = []
         node_raw_xy = []
         node_scan_indices = []
         node_batch_ids = []
         node_crop_windows = []
 
         batches = self.sample_batches(rng, dense_indices)
-
         valid_batch_id = 0
         
         for batch_indices in batches:
@@ -403,34 +395,34 @@ class OCTPuzzleDataset(pyg_data.Dataset):
             current_patches = []
             current_xy = []
             current_scan_indices = []
+            current_enface = []
 
             for scan_idx in batch_indices:
                 y_scan = idx_to_y[scan_idx]
 
                 img_crop = stack[scan_idx, :, c0:c1]
                 seg_crop = seg[scan_idx, :, c0:c1]
-
+                
+                enface_row = self.make_enface_row(img_crop, seg_crop, depth_pixels=100)
                 center_px = self.anatomy_center_pixels(img_crop, seg_crop)
 
                 if center_px is None:
                     continue
 
-                # row, local_col = center_px
-                # full_col = c0 + local_col
-
-                # gx, gy = self.pixel_to_display_xy(row, full_col, y_scan, full_shape)
-                gx = self.col_to_full_x((c0 + c1 - 1) / 2.0, full_shape)
+                gx = self.col_to_surface_x((c0 + c1 - 1) / 2.0, full_width_pixels)
                 gy = float(y_scan)
                
                 current_patches.append(self.crop_to_patch_tensor(img_crop))
+                current_enface.append(enface_row)
                 current_xy.append([gx, gy])
                 current_scan_indices.append(scan_idx)
 
             if len(current_patches) != len(batch_indices):
                 continue
 
-            for patch, xy, scan_idx in zip(current_patches, current_xy, current_scan_indices):
+            for patch, enface_row, xy, scan_idx in zip(current_patches, current_enface, current_xy, current_scan_indices):
                 node_patches.append(patch)
+                node_enface.append(enface_row)
                 node_raw_xy.append(xy)
                 node_scan_indices.append(scan_idx)
                 node_batch_ids.append(valid_batch_id)
@@ -445,20 +437,20 @@ class OCTPuzzleDataset(pyg_data.Dataset):
             raise RuntimeError("OCT sample produced fewer than 2 valid scan nodes at index {}".format(idx))
 
         patches = torch.stack(node_patches)
+        enface_rows = torch.stack(node_enface)
         raw_xy = torch.tensor(node_raw_xy, dtype=torch.float32)
 
         num_nodes = raw_xy.shape[0]
 
-        # anchor_idx = int(rng.integers(0, num_nodes))
-        anchor_idx = num_nodes // 2
+        anchor_idx = int(rng.integers(0, num_nodes))
+        # anchor_idx = num_nodes // 2
         anchor_xy = raw_xy[anchor_idx].clone()
 
         gt_delta = raw_xy - anchor_xy
         gt_delta[anchor_idx] = 0.0
         
-        x_scale = full_width
-        y_scale = (self.dense_size - 1) * self.scan_spacing + self.display_height
-
+        x_scale = full_width_mm
+        y_scale = dense_height_mm
         delta_scale = torch.tensor([x_scale, y_scale], dtype=torch.float32)
         
         # coordinates used by the model/diffusion process
@@ -468,8 +460,8 @@ class OCTPuzzleDataset(pyg_data.Dataset):
         # rough GPS-like conditioning metadata
         rough_delta, rough_radius = self.create_rough_relative_locations(gt_delta=gt_delta, anchor_idx=anchor_idx, rng=rng)
         
-        # edge_index = self.make_rough_neighborhood_graph(rough_delta, rough_radius, anchor_idx)
-        edge_index = self.make_complete_graph(num_nodes)
+        edge_index = self.make_rough_neighborhood_graph(rough_delta, rough_radius, anchor_idx)
+        # edge_index = self.make_complete_graph(num_nodes)
 
         # normalize rough coordinates using the same scale as the target
         rough_delta_model = rough_delta / delta_scale
@@ -503,60 +495,75 @@ class OCTPuzzleDataset(pyg_data.Dataset):
         rough_radius_model = rough_radius / delta_scale.unsqueeze(0)
         rough_radius_model[anchor_idx] = 0.0
         
-        
         is_anchor = torch.zeros(num_nodes, 1, dtype=torch.float32)
         is_anchor[anchor_idx, 0] = 1.0
         
-
         data = pyg_data.Data(
-            # Diffusion model target: approximately [-1, 1] on both axes
+            # diffusion target
             x=correction_model,
-    
+
+            # model visual input
             patches=patches,
+
+            # visualization-only en-face information
+            enface_rows=enface_rows,
+            dense_enface=dense_enface.unsqueeze(0),
+
+            # graph, where edges exist and what information is passed along them
             edge_index=edge_index,
             edge_attr=edge_attr,
+
+            # sample metadata
             ind_name=torch.tensor([volume_idx]).long(),
             sample_idx=torch.tensor([sample_idx]).long(),
             sample_seed=torch.tensor([sample_seed]).long(),
             patches_dim=torch.tensor([[num_nodes, 1]]),
 
+            # node metadata
             scan_indices=torch.tensor(node_scan_indices).long(),
             batch_ids=torch.tensor(node_batch_ids).long(),
             crop_windows=torch.tensor(node_crop_windows).long(),
 
-            # Original coordinate information
+            # original physical coordinates in mm
             raw_xy=raw_xy,
             gt_delta=gt_delta,
-            
-            # Model-coordinate target and conversion scale
+
+            # model-coordinate target and normalization
             gt_delta_model=gt_delta_model,
             delta_scale=delta_scale.unsqueeze(0),
-            
-            # Rough GPS-like conditioning in physical coordinates
+
+            # rough position conditioning in physical coordinates (raw mm)
             rough_delta=rough_delta,
             rough_radius=rough_radius,
 
-            # Rough GPS-like conditioning in model coordinates
+            # rough position conditioning in model coordinates (normalized)
             rough_delta_model=rough_delta_model,
             rough_radius_model=rough_radius_model,
-            
+
+            # Residual correction target: raw, normalized and norm scale
             correction=correction,
             correction_model=correction_model,
             correction_scale=correction_scale.unsqueeze(0),
-    
+
+            # anchor information
             anchor_idx=torch.tensor([anchor_idx]).long(),
-            anchor_xy=anchor_xy[None, :],
+            anchor_xy=anchor_xy.unsqueeze(0),
             is_anchor=is_anchor,
 
+            # dense reference information
             dense_imgs=dense_imgs.unsqueeze(0),
             dense_scan_indices=dense_scan_indices.unsqueeze(0),
             dense_y=dense_y.unsqueeze(0),
 
+            # plot / physical FOV information
             xlim=torch.tensor(xlim, dtype=torch.float32),
             ylim=torch.tensor(ylim, dtype=torch.float32),
-            full_width=torch.tensor([full_width], dtype=torch.float32),
+
+            full_width=torch.tensor([full_width_mm], dtype=torch.float32),
             crop_display_width=torch.tensor([crop_display_width], dtype=torch.float32),
-            display_height=torch.tensor([self.display_height], dtype=torch.float32),
+
+            # physical spacing between adjacent B-scans
+            scan_spacing=torch.tensor([self.y_spacing_mm], dtype=torch.float32),
         )
 
         return data
