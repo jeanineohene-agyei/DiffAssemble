@@ -454,12 +454,6 @@ def get_dataset(cfg):
         **common_dataset_args,
     )
 
-    audit_coordinate_scales(
-        train_dt,
-        output_path="coordinate_audit.txt",
-        num_samples=10,
-    )
-
     val_dt = OCTPuzzleDataset(
         bscan_paths=val_bscan_paths,
         seg_paths=val_seg_paths,
