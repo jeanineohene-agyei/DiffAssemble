@@ -831,8 +831,8 @@ class GNN_Diffusion(pl.LightningModule):
 
         # img = imgs[-1]
 
-        # for i in range(int(batch.batch.max().item()) + 1):
-        for i in range(min(batch.batch.max().item() + 1, 4)):
+        for i in range(int(batch.batch.max().item()) + 1):
+        # for i in range(min(batch.batch.max().item() + 1, 4)):
             idx = torch.where(batch.batch == i)[0]
 
             scale = batch.delta_scale.view(-1, 2)[i]
